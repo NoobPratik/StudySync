@@ -41,12 +41,18 @@
 
 ```bash
 cp .env.example .env
-# Set a strong BETTER_AUTH_SECRET and your BETTER_AUTH_URL in .env
+# Set POSTGRES_PASSWORD (required) and a strong BETTER_AUTH_SECRET in .env
 
+# Preferred, from the homelab root (loads TAILSCALE_IP):
+make up STACK=studysync
+# Or from this directory:
 docker compose up -d --build
 ```
 
-The entrypoint waits for PostgreSQL, runs `prisma db push` automatically, and starts the server at `http://localhost:3000`.
+The entrypoint waits for PostgreSQL, runs `prisma db push` automatically, and starts the server
+bound to the Pi's Tailscale IP at `http://100.69.244.116:3000`. Public access is through the
+Cloudflare tunnel hostname `https://study.pratik2296.dev`, whose origin is
+`http://100.69.244.116:3000`.
 If using Ollama on your Docker host, configure the AI base URL in **Settings** to `http://host.docker.internal:11434/v1`.
 
 ### Option 2 — Local Development (SQLite)
@@ -55,7 +61,7 @@ If using Ollama on your Docker host, configure the AI base URL in **Settings** t
 npm install
 cp .env.example .env
 npx prisma db push
-npm run dev
+node node_modules/next/dist/bin/next dev --webpack   # .npmrc sets bin-links=false, so there is no .bin/next shim
 ```
 
 Open `http://localhost:3000`, create an account, and configure your AI provider in **Settings**.

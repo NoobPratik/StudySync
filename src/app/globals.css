@@ -138,11 +138,18 @@ body {
   background: linear-gradient(135deg, #7C3AED, #A78BFA, #6366F1, #7C3AED);
   background-size: 300% 300%;
   animation: gradient-shift 4s ease infinite;
-  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-  mask-composite: exclude;
   -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
   -webkit-mask-composite: xor;
+  mask-composite: exclude;
   pointer-events: none;
+}
+
+/* Preserve mask-composite in production CSS optimization (Lightning CSS/PostCSS) */
+@supports (mask-composite: exclude) {
+  .gradient-border::before {
+    mask-composite: exclude;
+  }
 }
 
 @keyframes gradient-shift {

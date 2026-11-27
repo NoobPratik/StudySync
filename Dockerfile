@@ -23,7 +23,15 @@ ENV BETTER_AUTH_SECRET="build-time-placeholder-secret-replace-at-runtime"
 ENV BETTER_AUTH_URL="http://localhost:3000"
 
 RUN node node_modules/prisma/build/index.js generate
-RUN npm run build
+# .npmrc sets bin-links=false, so there is no node_modules/.bin/next shim.
+# Invoke the Next.js CLI entrypoint directly, like the Prisma command above.
+RUN node node_modules/next/dist/bin/next build --webpack
+
+# Next's output tracing keeps the libsql JS wrapper but omits its platform-native
+# package. The Prisma adapter imports it eagerly even when running on PostgreSQL,
+# so copy the installed @libsql packages into the standalone output.
+RUN mkdir -p .next/standalone/node_modules/@libsql \
+  && cp -a node_modules/@libsql/. .next/standalone/node_modules/@libsql/
 
 # Separate lightweight directory containing Prisma CLI + dotenv for entrypoint schema sync
 RUN mkdir -p /prisma-cli && cd /prisma-cli \
