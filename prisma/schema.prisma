@@ -1,0 +1,414 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ─── Better Auth Core Tables ────────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String
+  emailVerified Boolean   @default(false)
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  sessions         Session[]
+  accounts         Account[]
+  profile          Profile?
+  aiConfig         AiConfig?
+  calendarEvents   CalendarEvent[]
+  deadlines        Deadline[]
+  subjects         Subject[]
+  notes            Note[]
+  pomodoroSessions PomodoroSession[]
+  chatThreads      ChatThread[]
+  todos            TodoItem[]
+  scratchNotes     ScratchNote[]
+  flashcardDecks   FlashcardDeck[]
+  samplePapers     SamplePaper[]
+  mockExams        MockExam[]
+  pushSubscriptions PushSubscription[]
+  notificationPref  NotificationPreference?
+  notificationLogs  NotificationLog[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Account {
+  id                    String    @id @default(cuid())
+  userId                String
+  accountId             String
+  providerId            String
+  accessToken           String?
+  refreshToken          String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  idToken               String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Verification {
+  id         String   @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+// ─── Student Profile ────────────────────────────────────────────────────────
+
+model Profile {
+  id              String    @id @default(cuid())
+  userId          String    @unique
+  program         String?   // e.g., BTech, BCA, BSc, BA, MSc
+  branch          String?   // e.g., CSE, ECE, ME, Computer Science
+  year            String?   // e.g., 1st, 2nd, 3rd, 4th
+  semester        String?   // e.g., 1st, 2nd, ...8th
+  section         String?   // Optional section/cohort
+  rollNo          String?   // Optional roll number
+  usn             String?   // Optional student/university ID
+  institution     String?   // College/University name
+  semesterEndDate DateTime? // Target end-sem / exam date for pacing
+  customFields    String?   // JSON string for universal custom academic fields
+  dashboardOrder  String?   // JSON array of dashboard card keys in priority order
+  aiBriefing      String?   // Latest AI daily priority briefing JSON
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── AI Configuration & Chat ────────────────────────────────────────────────
+
+model AiConfig {
+  id                 String  @id @default(cuid())
+  userId             String  @unique
+  baseUrl            String  @default("http://localhost:11434/v1")
+  apiKey             String?
+  model              String  @default("qwen3.5:9b")
+  fastModel          String? // Smaller model (e.g., qwen3.5:4b) for quick tasks like topic extraction & categorization
+  timeoutSeconds     Int     @default(300) // Extended timeout for local 8GB VRAM inference
+  customInstructions String?
+  temperature        Float   @default(0.4)
+  debugMode          Boolean @default(false) // Show live AI thinking stream across AI features
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ChatThread {
+  id        String   @id @default(cuid())
+  userId    String
+  subjectId String?
+  title     String
+
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject  Subject?      @relation(fields: [subjectId], references: [id])
+  messages ChatMessage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ChatMessage {
+  id        String   @id @default(cuid())
+  threadId  String
+  role      String   // user | assistant
+  content   String
+  createdAt DateTime @default(now())
+
+  thread ChatThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+}
+
+// ─── Utilities: To-Do List & Brainstorming Notes ────────────────────────────
+
+model TodoItem {
+  id          String    @id @default(cuid())
+  userId      String
+  title       String
+  category    String    @default("GENERAL") // GENERAL, COLLEGE, ERRAND, PERSONAL
+  isCompleted Boolean   @default(false)
+  dueDate     DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ScratchNote {
+  id         String  @id @default(cuid())
+  userId     String
+  title      String
+  content    String
+  rawContent String? // Original user draft preserved when AI Optimize rewrites content
+  color      String  @default("#7C3AED")
+  pinned     Boolean @default(false)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Practice Studio: Flashcards & PYQ Mock Exams ───────────────────────────
+
+model FlashcardDeck {
+  id        String   @id @default(cuid())
+  userId    String
+  subjectId String?
+  title     String
+  source    String?  // Note title or module scope description
+
+  user    User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject Subject?    @relation(fields: [subjectId], references: [id])
+  cards   Flashcard[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Flashcard {
+  id             String    @id @default(cuid())
+  deckId         String
+  front          String
+  back           String
+  topicTag       String?
+  easeFactor     Float     @default(2.5)
+  intervalDays   Int       @default(0)
+  repetitions    Int       @default(0)
+  nextReviewAt   DateTime  @default(now())
+  lastReviewedAt DateTime?
+
+  deck FlashcardDeck @relation(fields: [deckId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+}
+
+model SamplePaper {
+  id            String   @id @default(cuid())
+  userId        String
+  subjectId     String?
+  title         String
+  fileName      String
+  extractedText String
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject   Subject?   @relation(fields: [subjectId], references: [id])
+  mockExams MockExam[]
+
+  createdAt DateTime @default(now())
+}
+
+model MockExam {
+  id              String    @id @default(cuid())
+  userId          String
+  subjectId       String?
+  samplePaperId   String?
+  title           String
+  durationMinutes Int       @default(90)
+  totalMarks      Int       @default(50)
+  examContent     String    // JSON of structured sections & questions with model answers
+  score           Int?
+  completedAt     DateTime?
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject     Subject?     @relation(fields: [subjectId], references: [id])
+  samplePaper SamplePaper? @relation(fields: [samplePaperId], references: [id])
+
+  createdAt DateTime @default(now())
+}
+
+// ─── Calendar ───────────────────────────────────────────────────────────────
+
+model CalendarEvent {
+  id          String   @id @default(cuid())
+  userId      String
+  title       String
+  description String?
+  eventType   String   @default("CUSTOM") // LECTURE, HOLIDAY, EXAM, LAB, CUSTOM
+  startAt     DateTime
+  endAt       DateTime
+  allDay      Boolean  @default(false)
+  recurrence  String?  // JSON string for recurrence rules
+  color       String?
+  location    String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Deadlines ──────────────────────────────────────────────────────────────
+
+model Deadline {
+  id           String   @id @default(cuid())
+  userId       String
+  title        String
+  description  String?
+  questions    String?  // Extracted text from uploaded assignment sheet or pasted questions
+  aiAnswer     String?  // Persisted AI-generated solution
+  aiAnswerMode String?  // answer | project_report | viva_prep
+  aiSources    String?  // JSON of openedNotes + webSources
+  deadlineType String   @default("ASSIGNMENT") // ASSIGNMENT, LAB_EXAM, TEST, MID_SEM, END_SEM, PROJECT, OTHER
+  dueAt        DateTime
+  priority     String   @default("MEDIUM") // LOW, MEDIUM, HIGH, URGENT
+  status       String   @default("PENDING") // PENDING, IN_PROGRESS, COMPLETED
+  subjectId    String?
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject Subject? @relation(fields: [subjectId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Subjects & Progress ────────────────────────────────────────────────────
+
+model Subject {
+  id       String  @id @default(cuid())
+  userId   String
+  name     String
+  code     String?
+  semester String?
+  color    String  @default("#7C3AED")
+
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  modules          Module[]
+  notes            Note[]
+  deadlines        Deadline[]
+  pomodoroSessions PomodoroSession[]
+  chatThreads      ChatThread[]
+  flashcardDecks   FlashcardDeck[]
+  samplePapers     SamplePaper[]
+  mockExams        MockExam[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Module {
+  id        String @id @default(cuid())
+  subjectId String
+  name      String
+  order     Int    @default(0)
+
+  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  topics  Topic[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Topic {
+  id          String  @id @default(cuid())
+  moduleId    String
+  name        String
+  order       Int     @default(0)
+  isCompleted Boolean @default(false)
+
+  module Module @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+// ─── Notes & File Uploads ───────────────────────────────────────────────────
+
+model Note {
+  id            String   @id @default(cuid())
+  userId        String
+  subjectId     String?
+  title         String
+  fileName      String
+  fileType      String
+  fileSize      Int
+  filePath      String
+  extractedText String?
+  uploadedAt    DateTime @default(now())
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject Subject? @relation(fields: [subjectId], references: [id])
+}
+
+// ─── Pomodoro Sessions ──────────────────────────────────────────────────────
+
+model PomodoroSession {
+  id            String   @id @default(cuid())
+  userId        String
+  subjectId     String?
+  duration      Int      // in seconds
+  breakDuration Int      @default(300) // 5 minutes in seconds
+  sessionType   String   @default("FOCUS") // FOCUS, SHORT_BREAK, LONG_BREAK
+  completedAt   DateTime @default(now())
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject Subject? @relation(fields: [subjectId], references: [id])
+}
+
+// ─── Push Notifications & App Secrets ───────────────────────────────────────
+
+model PushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model NotificationPreference {
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  enabled           Boolean  @default(true)
+  classLeadMinutes  Int      @default(5)  // e.g. 5 min before class
+  deadlineLeadHours Int      @default(24) // e.g. 24h (1 day) before deadline
+  updatedAt         DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model NotificationLog {
+  id       String   @id @default(cuid())
+  userId   String
+  dedupKey String   @unique
+  sentAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}

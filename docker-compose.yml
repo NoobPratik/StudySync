@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: studysync-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-studysync}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-studysync_secret_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-studysync}
+    volumes:
+      - /mnt/drive/studysync/database:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-studysync} -d ${POSTGRES_DB:-studysync}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: studysync-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - '${APP_PORT:-3000}:3000'
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-studysync}:${POSTGRES_PASSWORD:-defaultpassword}@postgres:5432/${POSTGRES_DB:-studysync}?schema=public
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-dGhyZXdsdW5nc3ByaXZhdGV3b21lbnNvdXJjZWNvdmU=}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-https://study.pratik2296.dev}
+      TRUSTED_ORIGINS: ${TRUSTED_ORIGINS:-https://study.pratik2296.dev}
+      UPLOAD_DIR: /app/uploads
+
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-mailto:admin@studysync.local}
+    volumes:
+      - /mnt/drive/studysync/uploads:/app/uploads
