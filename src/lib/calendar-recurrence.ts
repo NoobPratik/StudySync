@@ -1,3 +1,9 @@
+import {
+  getZonedParts,
+  resolveTimeZone,
+  zonedWallTimeToUtc,
+} from "./timezone";
+
 export interface RecurrenceRule {
   frequency: "NONE" | "DAILY" | "WEEKLY";
   daysOfWeek?: number[]; // 0 = Sun, 1 = Mon ... 6 = Sat
@@ -33,7 +39,15 @@ export interface ExpandedCalendarEvent {
   location: string | null;
 }
 
-export function parseRecurrence(raw: string | null | undefined): RecurrenceRule | null {
+interface WallDate {
+  year: number;
+  month: number;
+  day: number;
+}
+
+export function parseRecurrence(
+  raw: string | null | undefined,
+): RecurrenceRule | null {
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as RecurrenceRule;
@@ -44,34 +58,70 @@ export function parseRecurrence(raw: string | null | undefined): RecurrenceRule 
   }
 }
 
-function toDateKey(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+function toWallDateKey(d: WallDate): string {
+  const m = String(d.month).padStart(2, "0");
+  const day = String(d.day).padStart(2, "0");
+  return `${d.year}-${m}-${day}`;
+}
+
+function compareWallDates(a: WallDate, b: WallDate): number {
+  if (a.year !== b.year) return a.year - b.year;
+  if (a.month !== b.month) return a.month - b.month;
+  return a.day - b.day;
+}
+
+function addWallDays(d: WallDate, days: number): WallDate {
+  const next = new Date(Date.UTC(d.year, d.month - 1, d.day + days));
+  return {
+    year: next.getUTCFullYear(),
+    month: next.getUTCMonth() + 1,
+    day: next.getUTCDate(),
+  };
+}
+
+function getWallDayOfWeek(d: WallDate): number {
+  return new Date(Date.UTC(d.year, d.month - 1, d.day)).getUTCDay();
+}
+
+function parseWallDateString(raw: string): WallDate | null {
+  const match = raw.trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!match) return null;
+  return {
+    year: Number(match[1]),
+    month: Number(match[2]),
+    day: Number(match[3]),
+  };
 }
 
 export function expandCalendarEvents(
   events: RawCalendarEvent[],
   rangeStart: Date,
   rangeEnd: Date,
+  timeZone?: string | null,
 ): ExpandedCalendarEvent[] {
+  const tz = resolveTimeZone(timeZone);
   const result: ExpandedCalendarEvent[] = [];
-  const startDay = new Date(
-    rangeStart.getFullYear(),
-    rangeStart.getMonth(),
-    rangeStart.getDate(),
-    0,
-    0,
-    0,
+
+  const rangeStartParts = getZonedParts(rangeStart, tz);
+  const rangeEndParts = getZonedParts(rangeEnd, tz);
+  const rangeStartDate: WallDate = {
+    year: rangeStartParts.year,
+    month: rangeStartParts.month,
+    day: rangeStartParts.day,
+  };
+  const rangeEndDate: WallDate = {
+    year: rangeEndParts.year,
+    month: rangeEndParts.month,
+    day: rangeEndParts.day,
+  };
+
+  const startDay = zonedWallTimeToUtc(
+    { ...rangeStartDate, hour: 0, minute: 0, second: 0 },
+    tz,
   );
-  const endDay = new Date(
-    rangeEnd.getFullYear(),
-    rangeEnd.getMonth(),
-    rangeEnd.getDate(),
-    23,
-    59,
-    59,
+  const endDay = zonedWallTimeToUtc(
+    { ...rangeEndDate, hour: 23, minute: 59, second: 59 },
+    tz,
   );
 
   for (const ev of events) {
@@ -100,22 +150,24 @@ export function expandCalendarEvents(
       continue;
     }
 
-    const baseAnchorDay = new Date(
-      baseStart.getFullYear(),
-      baseStart.getMonth(),
-      baseStart.getDate(),
-      0,
-      0,
-      0,
-    );
-    const untilDate = rule.until
-      ? new Date(`${rule.until.slice(0, 10)}T23:59:59`)
-      : null;
-    const effectiveStart = baseAnchorDay > startDay ? baseAnchorDay : startDay;
-    const effectiveEnd =
-      untilDate && untilDate < endDay ? untilDate : endDay;
+    const baseParts = getZonedParts(baseStart, tz);
+    const baseAnchorDate: WallDate = {
+      year: baseParts.year,
+      month: baseParts.month,
+      day: baseParts.day,
+    };
+    const untilDate = rule.until ? parseWallDateString(rule.until) : null;
 
-    if (effectiveStart > effectiveEnd) continue;
+    const effectiveStart =
+      compareWallDates(baseAnchorDate, rangeStartDate) > 0
+        ? baseAnchorDate
+        : rangeStartDate;
+    const effectiveEnd =
+      untilDate && compareWallDates(untilDate, rangeEndDate) < 0
+        ? untilDate
+        : rangeEndDate;
+
+    if (compareWallDates(effectiveStart, effectiveEnd) > 0) continue;
 
     const exSet = new Set(rule.exDates || []);
     const allowedDays =
@@ -123,34 +175,37 @@ export function expandCalendarEvents(
         ? new Set(
             rule.daysOfWeek && rule.daysOfWeek.length > 0
               ? rule.daysOfWeek
-              : [baseStart.getDay()],
+              : [baseParts.dayOfWeek],
           )
         : null;
 
-    const cursor = new Date(effectiveStart);
-    while (cursor <= effectiveEnd) {
+    let cursor = effectiveStart;
+    while (compareWallDates(cursor, effectiveEnd) <= 0) {
+      const cursorDow = getWallDayOfWeek(cursor);
       const dayMatches =
         rule.frequency === "DAILY" ||
-        (allowedDays ? allowedDays.has(cursor.getDay()) : false);
+        (allowedDays ? allowedDays.has(cursorDow) : false);
 
-      const dateKey = toDateKey(cursor);
+      const dateKey = toWallDateKey(cursor);
       if (dayMatches && !exSet.has(dateKey)) {
-        const occStart = new Date(
-          cursor.getFullYear(),
-          cursor.getMonth(),
-          cursor.getDate(),
-          baseStart.getHours(),
-          baseStart.getMinutes(),
-          baseStart.getSeconds(),
-        );
+        const occStart = ev.allDay
+          ? zonedWallTimeToUtc(
+              { ...cursor, hour: 0, minute: 0, second: 0 },
+              tz,
+            )
+          : zonedWallTimeToUtc(
+              {
+                ...cursor,
+                hour: baseParts.hour,
+                minute: baseParts.minute,
+                second: baseParts.second,
+              },
+              tz,
+            );
         const occEnd = ev.allDay
-          ? new Date(
-              cursor.getFullYear(),
-              cursor.getMonth(),
-              cursor.getDate(),
-              23,
-              59,
-              59,
+          ? zonedWallTimeToUtc(
+              { ...cursor, hour: 23, minute: 59, second: 59 },
+              tz,
             )
           : new Date(occStart.getTime() + durationMs);
 
@@ -169,7 +224,7 @@ export function expandCalendarEvents(
           location: ev.location,
         });
       }
-      cursor.setDate(cursor.getDate() + 1);
+      cursor = addWallDays(cursor, 1);
     }
   }
 

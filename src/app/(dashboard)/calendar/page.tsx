@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useMemo, useRef } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef, useSyncExternalStore } from "react";
 import { motion } from "framer-motion";
 import {
   format,
@@ -59,6 +59,7 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { cn, getEventTypeColor } from "@/lib/utils";
+import { getBrowserTimeZone, getShortTimeZoneName } from "@/lib/timezone";
 import { DateInputDDMMYYYY } from "@/components/ui/date-input";
 import { AiDebugPanel } from "@/components/ui/ai-debug-panel";
 import { readSseStream } from "@/lib/sse-client";
@@ -183,6 +184,7 @@ function formatCompactTimeRange(startIso: string, endIso: string): string {
 }
 
 const HOUR_ROW_HEIGHT = 82; // px per hour on the time grid so 50-min classes comfortably fit title + time
+const subscribeNoop = () => () => { };
 
 type ViewMode = "WEEK" | "MONTH" | "DAY";
 
@@ -200,6 +202,17 @@ export default function CalendarPage() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  // Reset / Mass delete state
+  const [clearDialogOpen, setClearDialogOpen] = useState(false);
+  const [clearScope, setClearScope] = useState<"recurring" | "all" | "selected">("recurring");
+  const [selectedClearIds, setSelectedClearIds] = useState<string[]>([]);
+  const [clearing, setClearing] = useState(false);
+  const tzLabel = useSyncExternalStore(
+    subscribeNoop,
+    () => getShortTimeZoneName(getBrowserTimeZone()),
+    () => "IST",
+  );
 
   // Form state
   const [title, setTitle] = useState("");
@@ -279,6 +292,7 @@ export default function CalendarPage() {
       const qs = new URLSearchParams({
         start: range.start.toISOString(),
         end: range.end.toISOString(),
+        tz: getBrowserTimeZone(),
       });
       const res = await fetch(`/api/calendar?${qs.toString()}`);
       if (!res.ok) throw new Error();
@@ -297,6 +311,7 @@ export default function CalendarPage() {
     const qs = new URLSearchParams({
       start: range.start.toISOString(),
       end: range.end.toISOString(),
+      tz: getBrowserTimeZone(),
     });
     fetch(`/api/calendar?${qs.toString()}`)
       .then((res) => {
@@ -446,15 +461,15 @@ export default function CalendarPage() {
       freq === "NONE"
         ? null
         : {
-            frequency: freq,
-            daysOfWeek:
-              freq === "WEEKLY"
-                ? daysOfWeek.length > 0
-                  ? daysOfWeek
-                  : [startAt.getDay()]
-                : undefined,
-            until: repeatUntil || null,
-          };
+          frequency: freq,
+          daysOfWeek:
+            freq === "WEEKLY"
+              ? daysOfWeek.length > 0
+                ? daysOfWeek
+                : [startAt.getDay()]
+              : undefined,
+          until: repeatUntil || null,
+        };
 
     setSubmitting(true);
     try {
@@ -514,6 +529,50 @@ export default function CalendarPage() {
       fetchEvents();
     } catch {
       toast.error("Failed to delete event");
+    }
+  }
+
+  const recurringRawEvents = useMemo(
+    () => rawEvents.filter((r) => Boolean(r.recurrence)),
+    [rawEvents],
+  );
+
+  function openClearDialog(defaultScope?: "recurring" | "all" | "selected") {
+    const fallbackScope =
+      recurringRawEvents.length > 0 ? "recurring" : "all";
+    setClearScope(defaultScope ?? fallbackScope);
+    setSelectedClearIds(rawEvents.map((r) => r.id));
+    setClearDialogOpen(true);
+  }
+
+  async function handleClearCalendar() {
+    if (clearScope === "selected" && selectedClearIds.length === 0) {
+      toast.error("Select at least one series to delete");
+      return;
+    }
+    setClearing(true);
+    try {
+      const res = await fetch("/api/calendar", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          scope: clearScope,
+          ids: clearScope === "selected" ? selectedClearIds : undefined,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Failed to clear calendar");
+      toast.success(
+        `Deleted ${json.deletedCount} calendar series`,
+      );
+      setClearDialogOpen(false);
+      fetchEvents();
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to clear calendar",
+      );
+    } finally {
+      setClearing(false);
     }
   }
 
@@ -606,6 +665,8 @@ export default function CalendarPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          startDate: format(new Date(), "yyyy-MM-dd"),
+          timeZone: getBrowserTimeZone(),
           items: selected.map((r) => ({
             title: r.title.trim(),
             description: r.description?.trim() || null,
@@ -673,6 +734,16 @@ export default function CalendarPage() {
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
+          {rawEvents.length > 0 && (
+            <Button
+              variant="outline"
+              onClick={() => openClearDialog()}
+              className="border-destructive/30 text-destructive hover:bg-destructive/10 hover:text-destructive"
+            >
+              <Trash2 className="h-4 w-4" />
+              Reset / Clear ({rawEvents.length})
+            </Button>
+          )}
           <Button variant="outline" onClick={() => setTtOpen(true)}>
             <Upload className="h-4 w-4 text-primary" />
             Import Timetable
@@ -802,7 +873,7 @@ export default function CalendarPage() {
                 }}
               >
                 <div className="py-3 px-2 text-[11px] font-medium text-muted-foreground text-center border-r border-glass-border/50 flex items-center justify-center">
-                  IST
+                  {tzLabel}
                 </div>
                 {visibleWeekDays.map((day) => {
                   const isToday = isSameDay(day, new Date());
@@ -866,46 +937,46 @@ export default function CalendarPage() {
                   (e) => e.allDay && isSameDay(new Date(e.startAt), d),
                 ),
               ) && (
-                <div
-                  className="grid border-b border-glass-border/60 bg-background/40"
-                  style={{
-                    gridTemplateColumns: `68px repeat(${visibleWeekDays.length}, minmax(0, 1fr))`,
-                  }}
-                >
-                  <div className="py-1.5 px-2 text-[10px] text-muted-foreground text-center border-r border-glass-border/40 flex items-center justify-center">
-                    All Day
+                  <div
+                    className="grid border-b border-glass-border/60 bg-background/40"
+                    style={{
+                      gridTemplateColumns: `68px repeat(${visibleWeekDays.length}, minmax(0, 1fr))`,
+                    }}
+                  >
+                    <div className="py-1.5 px-2 text-[10px] text-muted-foreground text-center border-r border-glass-border/40 flex items-center justify-center">
+                      All Day
+                    </div>
+                    {visibleWeekDays.map((day) => {
+                      const allDayEvs = filteredEvents.filter(
+                        (e) => e.allDay && isSameDay(new Date(e.startAt), day),
+                      );
+                      return (
+                        <div
+                          key={`ad-${day.toISOString()}`}
+                          className="p-1.5 border-r last:border-r-0 border-glass-border/40 space-y-1"
+                        >
+                          {allDayEvs.map((ev) => {
+                            const pal = getEventPalette(ev);
+                            return (
+                              <div
+                                key={ev.occurrenceId || ev.id}
+                                onClick={() => openEditSeries(ev.id)}
+                                className="rounded-md px-2 py-1 text-[11px] font-medium truncate cursor-pointer border"
+                                style={{
+                                  backgroundColor: pal.bg,
+                                  borderColor: `${pal.border}66`,
+                                  color: pal.text,
+                                }}
+                              >
+                                {ev.title}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })}
                   </div>
-                  {visibleWeekDays.map((day) => {
-                    const allDayEvs = filteredEvents.filter(
-                      (e) => e.allDay && isSameDay(new Date(e.startAt), day),
-                    );
-                    return (
-                      <div
-                        key={`ad-${day.toISOString()}`}
-                        className="p-1.5 border-r last:border-r-0 border-glass-border/40 space-y-1"
-                      >
-                        {allDayEvs.map((ev) => {
-                          const pal = getEventPalette(ev);
-                          return (
-                            <div
-                              key={ev.occurrenceId || ev.id}
-                              onClick={() => openEditSeries(ev.id)}
-                              className="rounded-md px-2 py-1 text-[11px] font-medium truncate cursor-pointer border"
-                              style={{
-                                backgroundColor: pal.bg,
-                                borderColor: `${pal.border}66`,
-                                color: pal.text,
-                              }}
-                            >
-                              {ev.title}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
+                )}
 
               {/* Scrollable Proportional Hour Grid */}
               {loading ? (
@@ -1085,7 +1156,7 @@ export default function CalendarPage() {
               "grid gap-3 items-stretch",
               weekLayout === "GRID" ? "grid-cols-1 md:hidden" : "grid-cols-1 sm:grid-cols-2",
               weekLayout === "LIST" &&
-                (visibleWeekDays.length <= 5 ? "lg:grid-cols-5" : "lg:grid-cols-7"),
+              (visibleWeekDays.length <= 5 ? "lg:grid-cols-5" : "lg:grid-cols-7"),
             )}
           >
             {visibleWeekDays.map((day) => {
@@ -1260,7 +1331,7 @@ export default function CalendarPage() {
                               ? "bg-muted/30 border-glass-border/60"
                               : "bg-transparent border-transparent opacity-40",
                             isSelected &&
-                              "border-primary bg-primary/15 shadow-sm shadow-primary/20",
+                            "border-primary bg-primary/15 shadow-sm shadow-primary/20",
                             !isSelected && "hover:border-primary/40",
                           )}
                         >
@@ -1731,6 +1802,29 @@ export default function CalendarPage() {
             </DialogDescription>
           </DialogHeader>
 
+          {rawEvents.length > 0 && (
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-xl border border-glass-border bg-muted/40 px-3.5 py-2.5 text-xs">
+              <span className="text-muted-foreground">
+                You currently have{" "}
+                <span className="text-foreground font-semibold">
+                  {rawEvents.length}
+                </span>{" "}
+                calendar series ({recurringRawEvents.length} recurring). Need a
+                fresh import?
+              </span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs border-destructive/30 text-destructive hover:bg-destructive/10 shrink-0"
+                onClick={() => openClearDialog()}
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                Reset Calendar
+              </Button>
+            </div>
+          )}
+
           <form onSubmit={handleParseTimetable} className="space-y-5">
             {/* 1. Upload & Visual Preview (Stacked Vertical Layout) */}
             <div className="space-y-2.5">
@@ -2036,10 +2130,10 @@ export default function CalendarPage() {
                               prev.map((r, i) =>
                                 i === idx
                                   ? {
-                                      ...r,
-                                      eventType:
-                                        v as ParsedTimetableRow["eventType"],
-                                    }
+                                    ...r,
+                                    eventType:
+                                      v as ParsedTimetableRow["eventType"],
+                                  }
                                   : r,
                               ),
                             )
@@ -2125,6 +2219,199 @@ export default function CalendarPage() {
               </DialogFooter>
             </div>
           )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Reset / Mass Delete Calendar Dialog */}
+      <Dialog open={clearDialogOpen} onOpenChange={setClearDialogOpen}>
+        <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto space-y-4">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-destructive">
+              <Trash2 className="h-5 w-5" />
+              Reset / Mass Delete Calendar
+            </DialogTitle>
+            <DialogDescription>
+              Remove imported timetable classes or reset your calendar in one
+              click. This permanently deletes the selected event series.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-2.5">
+            {recurringRawEvents.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setClearScope("recurring")}
+                className={cn(
+                  "w-full text-left rounded-xl border p-3.5 transition-all cursor-pointer",
+                  clearScope === "recurring"
+                    ? "border-destructive/60 bg-destructive/10"
+                    : "border-glass-border bg-muted/30 hover:border-glass-border/80",
+                )}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm font-semibold text-foreground">
+                    Delete recurring timetable classes only
+                  </span>
+                  <Badge variant="outline">
+                    {recurringRawEvents.length} series
+                  </Badge>
+                </div>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Clears weekly/daily imported classes while keeping one-time
+                  exams, holidays, and custom events.
+                </p>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setClearScope("all")}
+              className={cn(
+                "w-full text-left rounded-xl border p-3.5 transition-all cursor-pointer",
+                clearScope === "all"
+                  ? "border-destructive/60 bg-destructive/10"
+                  : "border-glass-border bg-muted/30 hover:border-glass-border/80",
+              )}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-sm font-semibold text-foreground">
+                  Reset entire calendar
+                </span>
+                <Badge variant="outline">{rawEvents.length} series</Badge>
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                Deletes every event and recurring series on your calendar.
+              </p>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setClearScope("selected")}
+              className={cn(
+                "w-full text-left rounded-xl border p-3.5 transition-all cursor-pointer",
+                clearScope === "selected"
+                  ? "border-destructive/60 bg-destructive/10"
+                  : "border-glass-border bg-muted/30 hover:border-glass-border/80",
+              )}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-sm font-semibold text-foreground">
+                  Select specific series to delete
+                </span>
+                <Badge variant="outline">
+                  {selectedClearIds.length} / {rawEvents.length} selected
+                </Badge>
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                Pick individual classes or events to bulk remove.
+              </p>
+            </button>
+          </div>
+
+          {clearScope === "selected" && (
+            <div className="space-y-2 pt-1">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-muted-foreground">
+                  {selectedClearIds.length} selected
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSelectedClearIds(rawEvents.map((r) => r.id))
+                    }
+                    className="text-accent hover:underline cursor-pointer"
+                  >
+                    Select all
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedClearIds([])}
+                    className="text-muted-foreground hover:underline cursor-pointer"
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+              <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1">
+                {rawEvents.map((raw) => {
+                  const checked = selectedClearIds.includes(raw.id);
+                  return (
+                    <label
+                      key={raw.id}
+                      className={cn(
+                        "flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-xs cursor-pointer transition-colors",
+                        checked
+                          ? "border-destructive/50 bg-destructive/10"
+                          : "border-glass-border/60 bg-muted/25",
+                      )}
+                    >
+                      <span className="flex items-center gap-2 min-w-0">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              setSelectedClearIds((prev) => [...prev, raw.id]);
+                            } else {
+                              setSelectedClearIds((prev) =>
+                                prev.filter((id) => id !== raw.id),
+                              );
+                            }
+                          }}
+                          className="rounded accent-destructive cursor-pointer shrink-0"
+                        />
+                        <span className="font-medium text-foreground truncate">
+                          {raw.title}
+                        </span>
+                      </span>
+                      <span className="text-[11px] text-muted-foreground shrink-0">
+                        {format(new Date(raw.startAt), "EEE HH:mm")} •{" "}
+                        {raw.eventType}
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setClearDialogOpen(false)}
+              disabled={clearing}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={handleClearCalendar}
+              disabled={
+                clearing ||
+                (clearScope === "recurring" &&
+                  recurringRawEvents.length === 0) ||
+                (clearScope === "selected" && selectedClearIds.length === 0) ||
+                rawEvents.length === 0
+              }
+            >
+              {clearing ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Deleting...
+                </>
+              ) : (
+                `Delete ${clearScope === "recurring"
+                  ? recurringRawEvents.length
+                  : clearScope === "selected"
+                    ? selectedClearIds.length
+                    : rawEvents.length
+                } Series`
+              )}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>

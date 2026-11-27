@@ -5,6 +5,7 @@ import http from "http";
 import https from "https";
 import { prisma } from "./prisma";
 import { expandCalendarEvents } from "./calendar-recurrence";
+import { resolveTimeZone } from "./timezone";
 import { extractTextFromBuffer } from "./document-parser";
 
 const UPLOAD_ROOT = path.resolve(
@@ -788,7 +789,8 @@ export async function buildSmartTutorContext(options: {
     }
   }
 
-  const upcomingEvents = expandCalendarEvents(rawEvents, now, in7Days).slice(
+  const aiTz = resolveTimeZone();
+  const upcomingEvents = expandCalendarEvents(rawEvents, now, in7Days, aiTz).slice(
     0,
     8,
   );

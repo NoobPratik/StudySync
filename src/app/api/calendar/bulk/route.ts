@@ -3,6 +3,11 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { getApiUser } from "@/lib/session";
 import { getEventTypeColor } from "@/lib/utils";
+import {
+  getZonedParts,
+  resolveTimeZone,
+  zonedWallTimeToUtc,
+} from "@/lib/timezone";
 
 const bulkItemSchema = z.object({
   title: z.string().min(1).max(200),
@@ -18,15 +23,28 @@ const bulkItemSchema = z.object({
 });
 
 const bulkCreateSchema = z.object({
-  items: z.array(bulkItemSchema).min(1, "Select at least one class to import").max(80),
+  items: z
+    .array(bulkItemSchema)
+    .min(1, "Select at least one class to import")
+    .max(80),
   startDate: z.string().optional(),
+  timeZone: z.string().max(100).optional(),
 });
 
-function nextOccurrenceOnOrAfter(baseDate: Date, targetDow: number): Date {
-  const d = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate());
-  const diff = (targetDow - d.getDay() + 7) % 7;
-  d.setDate(d.getDate() + diff);
-  return d;
+function nextOccurrenceDate(
+  anchor: { year: number; month: number; day: number },
+  targetDow: number,
+): { year: number; month: number; day: number } {
+  const baseUtc = new Date(
+    Date.UTC(anchor.year, anchor.month - 1, anchor.day),
+  );
+  const diff = (targetDow - baseUtc.getUTCDay() + 7) % 7;
+  baseUtc.setUTCDate(baseUtc.getUTCDate() + diff);
+  return {
+    year: baseUtc.getUTCFullYear(),
+    month: baseUtc.getUTCMonth() + 1,
+    day: baseUtc.getUTCDate(),
+  };
 }
 
 export async function POST(request: NextRequest) {
@@ -45,20 +63,46 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const baseDate = parsed.data.startDate
-      ? new Date(`${parsed.data.startDate.slice(0, 10)}T00:00:00`)
-      : new Date();
-    const anchorBase = isNaN(baseDate.getTime()) ? new Date() : baseDate;
+    const tz = resolveTimeZone(parsed.data.timeZone);
+    const startDateMatch = parsed.data.startDate
+      ?.trim()
+      .match(/^(\d{4})-(\d{2})-(\d{2})/);
+    const anchorParts = startDateMatch
+      ? {
+          year: Number(startDateMatch[1]),
+          month: Number(startDateMatch[2]),
+          day: Number(startDateMatch[3]),
+        }
+      : getZonedParts(new Date(), tz);
 
     const created = await prisma.$transaction(
       parsed.data.items.map((item) => {
-        const occDay = nextOccurrenceOnOrAfter(anchorBase, item.dayOfWeek);
-        const yyyy = occDay.getFullYear();
-        const mm = String(occDay.getMonth() + 1).padStart(2, "0");
-        const dd = String(occDay.getDate()).padStart(2, "0");
+        const occDay = nextOccurrenceDate(anchorParts, item.dayOfWeek);
+        const [startHour, startMinute] = item.startTime.split(":").map(Number);
+        const [endHour, endMinute] = item.endTime.split(":").map(Number);
 
-        const startAt = new Date(`${yyyy}-${mm}-${dd}T${item.startTime}:00`);
-        let endAt = new Date(`${yyyy}-${mm}-${dd}T${item.endTime}:00`);
+        const startAt = zonedWallTimeToUtc(
+          {
+            year: occDay.year,
+            month: occDay.month,
+            day: occDay.day,
+            hour: startHour,
+            minute: startMinute,
+            second: 0,
+          },
+          tz,
+        );
+        let endAt = zonedWallTimeToUtc(
+          {
+            year: occDay.year,
+            month: occDay.month,
+            day: occDay.day,
+            hour: endHour,
+            minute: endMinute,
+            second: 0,
+          },
+          tz,
+        );
         if (endAt <= startAt) {
           endAt = new Date(startAt.getTime() + 60 * 60 * 1000);
         }

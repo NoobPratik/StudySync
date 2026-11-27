@@ -39,6 +39,7 @@ services:
       - 'host.docker.internal:host-gateway'
     environment:
       NODE_ENV: production
+      TZ: ${TZ:-Asia/Kolkata}
       DATABASE_URL: postgresql://${POSTGRES_USER:-studysync}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in stacks/studysync/.env}@postgres:5432/${POSTGRES_DB:-studysync}?schema=public
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set in stacks/studysync/.env}
       BETTER_AUTH_URL: ${BETTER_AUTH_URL:-https://study.pratik2296.dev}

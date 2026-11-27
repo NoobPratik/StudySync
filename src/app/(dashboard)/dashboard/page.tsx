@@ -38,6 +38,7 @@ import {
   getPriorityColor,
 } from "@/lib/utils";
 import { useSession } from "@/lib/auth-client";
+import { getBrowserTimeZone } from "@/lib/timezone";
 import { StudyHeroEmblem } from "@/components/ui/study-emblem";
 
 interface DashboardData {
@@ -130,7 +131,8 @@ export default function DashboardPage() {
 
   const loadDashboard = useCallback(async () => {
     try {
-      const res = await fetch("/api/dashboard");
+      const tz = encodeURIComponent(getBrowserTimeZone());
+      const res = await fetch(`/api/dashboard?tz=${tz}`);
       if (!res.ok) throw new Error("Failed to load dashboard");
       const json: DashboardData = await res.json();
       setData(json);
@@ -145,7 +147,8 @@ export default function DashboardPage() {
 
   useEffect(() => {
     let active = true;
-    fetch("/api/dashboard")
+    const tz = encodeURIComponent(getBrowserTimeZone());
+    fetch(`/api/dashboard?tz=${tz}`)
       .then((res) => {
         if (!res.ok) throw new Error("Failed to load dashboard");
         return res.json();

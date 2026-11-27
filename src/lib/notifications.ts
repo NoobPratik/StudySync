@@ -2,6 +2,7 @@ import "server-only";
 import * as webpush from "web-push";
 import { prisma } from "./prisma";
 import { expandCalendarEvents } from "./calendar-recurrence";
+import { getZonedDayBounds, resolveTimeZone } from "./timezone";
 
 export interface PushPayload {
   title: string;
@@ -175,17 +176,19 @@ export async function dispatchUpcomingReminders(nowInput?: Date): Promise<{
 
     // 1. Check upcoming calendar lectures/exams starting within classLeadMinutes
     if (u.calendarEvents.length > 0) {
+      const tz = resolveTimeZone();
       const windowStart = now;
       const windowEnd = new Date(
         now.getTime() + classLeadMinutes * 60 * 1000 + 59_000,
       );
-      const dayBegin = new Date(
-        now.getFullYear(),
-        now.getMonth(),
-        now.getDate(),
-      );
+      const { start: dayBegin } = getZonedDayBounds(now, tz);
       const dayFinish = new Date(windowEnd.getTime() + 24 * 60 * 60 * 1000);
-      const expanded = expandCalendarEvents(u.calendarEvents, dayBegin, dayFinish);
+      const expanded = expandCalendarEvents(
+        u.calendarEvents,
+        dayBegin,
+        dayFinish,
+        tz,
+      );
 
       for (const ev of expanded) {
         if (ev.allDay) continue;
@@ -202,7 +205,7 @@ export async function dispatchUpcomingReminders(nowInput?: Date): Promise<{
         );
         const res = await sendPushToUser(u.id, {
           title: `${ev.eventType === "LAB" ? "Lab" : ev.eventType === "EXAM" ? "Exam" : "Class"} in ${formatDurationLabel(minsLeft)}: ${ev.title}`,
-          body: `${startAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}${ev.location ? ` • Room ${ev.location}` : ""}`,
+          body: `${startAt.toLocaleTimeString("en-IN", { timeZone: tz, hour: "numeric", minute: "2-digit" })}${ev.location ? ` • Room ${ev.location}` : ""}`,
           url: "/calendar",
           tag: `class-${ev.occurrenceId}`,
         });

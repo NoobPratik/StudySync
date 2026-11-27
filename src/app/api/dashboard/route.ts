@@ -3,6 +3,7 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { getApiUser } from "@/lib/session";
 import { expandCalendarEvents } from "@/lib/calendar-recurrence";
+import { getZonedDayBounds, resolveTimeZone } from "@/lib/timezone";
 
 const DEFAULT_CARD_ORDER = [
   "deadlines",
@@ -12,26 +13,15 @@ const DEFAULT_CARD_ORDER = [
   "notes",
 ];
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   const user = await getApiUser();
   if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const tz = resolveTimeZone(request.nextUrl.searchParams.get("tz"));
   const now = new Date();
-  const startOfToday = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate(),
-  );
-  const endOfToday = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate(),
-    23,
-    59,
-    59,
-  );
+  const { start: startOfToday, end: endOfToday } = getZonedDayBounds(now, tz);
   const in7Days = new Date(startOfToday.getTime() + 7 * 24 * 60 * 60 * 1000);
 
   const [
@@ -110,12 +100,12 @@ export async function GET() {
     }),
   ]);
 
-  const allTodayEvents = expandCalendarEvents(rawEvents, startOfToday, endOfToday);
+  const allTodayEvents = expandCalendarEvents(rawEvents, startOfToday, endOfToday, tz);
   // Only show today's lectures/events that haven't finished yet (or all-day notices)
   const todayEvents = allTodayEvents.filter(
     (e) => e.allDay || new Date(e.endAt) > now,
   );
-  const upcomingEvents = expandCalendarEvents(rawEvents, now, in7Days)
+  const upcomingEvents = expandCalendarEvents(rawEvents, now, in7Days, tz)
     .filter((e) => e.allDay || new Date(e.endAt) > now)
     .slice(0, 6);
 
