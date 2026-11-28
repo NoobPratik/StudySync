@@ -57,10 +57,14 @@ export async function GET(request: NextRequest) {
     }),
     prisma.subject.findMany({
       where: { userId: user.id },
+      orderBy: { createdAt: "asc" },
       include: {
         modules: {
+          orderBy: { order: "asc" },
           include: {
-            topics: true,
+            topics: {
+              orderBy: { order: "asc" },
+            },
           },
         },
       },
@@ -177,6 +181,35 @@ export async function GET(request: NextRequest) {
     }
   }
 
+  let nextStudyTarget: {
+    subjectId: string;
+    subjectName: string;
+    subjectColor: string;
+    moduleId: string;
+    moduleName: string;
+    topicId: string;
+    topicName: string;
+  } | null = null;
+
+  for (const sub of subjects) {
+    if (nextStudyTarget) break;
+    for (const mod of sub.modules) {
+      const nextTopic = mod.topics.find((t) => !t.isCompleted);
+      if (nextTopic) {
+        nextStudyTarget = {
+          subjectId: sub.id,
+          subjectName: sub.name,
+          subjectColor: sub.color,
+          moduleId: mod.id,
+          moduleName: mod.name,
+          topicId: nextTopic.id,
+          topicName: nextTopic.name,
+        };
+        break;
+      }
+    }
+  }
+
   return NextResponse.json({
     stats: {
       pendingDeadlines: pendingDeadlinesCount,
@@ -198,6 +231,7 @@ export async function GET(request: NextRequest) {
     upcomingEvents,
     subjectProgress,
     recentNotes,
+    nextStudyTarget,
     profile,
     cardOrder,
     aiBriefing,
@@ -205,7 +239,10 @@ export async function GET(request: NextRequest) {
 }
 
 const orderSchema = z.object({
-  cardOrder: z.array(z.string()).min(1).max(10),
+  cardOrder: z.array(z.string()).min(1).max(10).optional(),
+  layoutMode: z
+    .enum(["BENTO_360", "EXAM_SPRINT", "DEEP_STUDY", "DAILY_AGENDA"])
+    .optional(),
 });
 
 export async function PATCH(request: NextRequest) {
@@ -217,19 +254,50 @@ export async function PATCH(request: NextRequest) {
   const body = await request.json();
   const parsed = orderSchema.safeParse(body);
   if (!parsed.success) {
-    return NextResponse.json({ error: "Invalid card order" }, { status: 400 });
+    return NextResponse.json({ error: "Invalid dashboard settings" }, { status: 400 });
+  }
+
+  const existingProfile = await prisma.profile.findUnique({
+    where: { userId: user.id },
+    select: { aiBriefing: true },
+  });
+
+  let nextBriefingJson: string | undefined;
+  if (parsed.data.layoutMode) {
+    let existingObj: Record<string, unknown> = {};
+    if (existingProfile?.aiBriefing) {
+      try {
+        existingObj = JSON.parse(existingProfile.aiBriefing);
+      } catch {
+        existingObj = {};
+      }
+    }
+    nextBriefingJson = JSON.stringify({
+      ...existingObj,
+      layoutMode: parsed.data.layoutMode,
+      updatedAt: new Date().toISOString(),
+    });
   }
 
   await prisma.profile.upsert({
     where: { userId: user.id },
     create: {
       userId: user.id,
-      dashboardOrder: JSON.stringify(parsed.data.cardOrder),
+      dashboardOrder: parsed.data.cardOrder
+        ? JSON.stringify(parsed.data.cardOrder)
+        : undefined,
+      aiBriefing: nextBriefingJson,
     },
     update: {
-      dashboardOrder: JSON.stringify(parsed.data.cardOrder),
+      ...(parsed.data.cardOrder
+        ? { dashboardOrder: JSON.stringify(parsed.data.cardOrder) }
+        : {}),
+      ...(nextBriefingJson !== undefined ? { aiBriefing: nextBriefingJson } : {}),
     },
   });
 
-  return NextResponse.json({ cardOrder: parsed.data.cardOrder });
+  return NextResponse.json({
+    cardOrder: parsed.data.cardOrder,
+    layoutMode: parsed.data.layoutMode,
+  });
 }

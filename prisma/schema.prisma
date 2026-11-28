@@ -35,6 +35,7 @@ model User {
   pushSubscriptions PushSubscription[]
   notificationPref  NotificationPreference?
   notificationLogs  NotificationLog[]
+  aiLogs            AiLog[]
 }
 
 model Session {
@@ -125,10 +126,15 @@ model ChatThread {
   id        String   @id @default(cuid())
   userId    String
   subjectId String?
+  moduleId  String?
+  topicId   String?
+  mode      String   @default("COURSE") // TOPIC_STUDY | COURSE
   title     String
 
   user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  subject  Subject?      @relation(fields: [subjectId], references: [id])
+  subject  Subject?      @relation(fields: [subjectId], references: [id], onDelete: SetNull)
+  module   Module?       @relation(fields: [moduleId], references: [id], onDelete: SetNull)
+  topic    Topic?        @relation(fields: [topicId], references: [id], onDelete: SetNull)
   messages ChatMessage[]
 
   createdAt DateTime @default(now())
@@ -140,6 +146,7 @@ model ChatMessage {
   threadId  String
   role      String   // user | assistant
   content   String
+  metadata  String?  // JSON: { topicId, topicName, moduleId, moduleName, action, openedNotes, model }
   createdAt DateTime @default(now())
 
   thread ChatThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
@@ -319,21 +326,26 @@ model Module {
   name      String
   order     Int    @default(0)
 
-  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
-  topics  Topic[]
+  subject     Subject      @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  topics      Topic[]
+  chatThreads ChatThread[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
 
 model Topic {
-  id          String  @id @default(cuid())
-  moduleId    String
-  name        String
-  order       Int     @default(0)
-  isCompleted Boolean @default(false)
+  id           String  @id @default(cuid())
+  moduleId     String
+  name         String
+  order        Int     @default(0)
+  isCompleted  Boolean @default(false)
+  sourceNoteId String?
+  startPage    Int?
+  endPage      Int?
 
-  module Module @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  module      Module       @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  chatThreads ChatThread[]
 
   completedAt DateTime?
   createdAt   DateTime  @default(now())
@@ -411,4 +423,21 @@ model AppSetting {
   key       String   @id
   value     String
   updatedAt DateTime @updatedAt
+}
+
+model AiLog {
+  id           String   @id @default(cuid())
+  userId       String
+  feature      String
+  model        String
+  durationMs   Int      @default(0)
+  status       String   @default("SUCCESS")
+  inputPrompt  String
+  thinking     String?
+  rawOutput    String?
+  parsedOutput String?
+  errorMessage String?
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 }

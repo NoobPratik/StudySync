@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Suspense } from "react";
 import { requireUser } from "@/lib/session";
 import { Sidebar } from "@/components/sidebar";
+import { BackgroundExtractionProvider } from "@/components/background-extraction-provider";
 
 export const metadata: Metadata = {
   robots: {
@@ -52,8 +53,10 @@ async function AuthenticatedDashboardShell({
         aria-hidden="true"
       />
       <Sidebar user={user} />
-      <main className="flex-1 min-w-0 relative z-10">
-        <div className="p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">{children}</div>
+      <main className="flex-1 min-w-0">
+        <BackgroundExtractionProvider>
+          <div className="p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">{children}</div>
+        </BackgroundExtractionProvider>
       </main>
     </div>
   );

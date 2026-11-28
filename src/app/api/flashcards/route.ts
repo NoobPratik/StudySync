@@ -2,7 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { getApiUser } from "@/lib/session";
-import { callAiChat, extractJsonFromAi } from "@/lib/ai";
+import {
+  callAiChat,
+  ensureNoteText,
+  extractJsonFromAi,
+} from "@/lib/ai";
 import { AI_PROMPTS } from "@/lib/ai-prompts";
 
 export async function GET() {
@@ -95,7 +99,14 @@ export async function POST(request: NextRequest) {
         subjectId: subject.id,
         ...(noteIds && noteIds.length > 0 ? { id: { in: noteIds } } : {}),
       },
-      select: { id: true, title: true, fileName: true, extractedText: true },
+      select: {
+        id: true,
+        title: true,
+        fileName: true,
+        fileType: true,
+        filePath: true,
+        extractedText: true,
+      },
       orderBy: { uploadedAt: "desc" },
       take: noteIds && noteIds.length > 0 ? 6 : 25,
     });
@@ -151,9 +162,23 @@ export async function POST(request: NextRequest) {
           .map((m) => m.name)
       : [];
 
-    const noteContent = notes
-      .filter((n) => n.extractedText)
-      .map((n) => `[Note: ${n.title}]\n${n.extractedText!.slice(0, 2200)}`)
+    const hydratedNotes = await Promise.all(
+      notes.map(async (n) => {
+        const text = await ensureNoteText(n);
+        return { ...n, text };
+      }),
+    );
+
+    const validNotes = hydratedNotes.filter(
+      (n): n is typeof n & { text: string } => Boolean(n.text?.trim()),
+    );
+    const perNoteBudget = Math.max(
+      1800,
+      Math.floor(5500 / Math.max(1, validNotes.length)),
+    );
+
+    const noteContent = validNotes
+      .map((n) => `[Note: ${n.title}]\n${n.text.slice(0, perNoteBudget)}`)
       .join("\n\n");
 
     if (moduleLines.length === 0 && !noteContent) {
@@ -177,6 +202,8 @@ export async function POST(request: NextRequest) {
 
     const { content, model } = await callAiChat({
       userId: user.id,
+      logFeature: "flashcards_generate",
+      signal: request.signal,
       ...aiRequest,
     });
 

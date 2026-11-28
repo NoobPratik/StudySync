@@ -2,7 +2,7 @@ import path from "path";
 import JSZip from "jszip";
 import { extractText } from "unpdf";
 
-const MAX_EXTRACTED_CHARS = 35000;
+const MAX_EXTRACTED_CHARS = 150000;
 
 function decodeXmlEntities(str: string): string {
   return str
@@ -42,12 +42,18 @@ export async function extractTextFromBuffer(
       return buffer.toString("utf-8").slice(0, MAX_EXTRACTED_CHARS).trim() || null;
     }
 
-    // PDF
+    // PDF — extract per-page to preserve exact chronological page boundaries
     if (ext === ".pdf" || lowerMime.includes("pdf")) {
-      const { text } = await extractText(new Uint8Array(buffer), {
-        mergePages: true,
+      const { text: pages } = await extractText(new Uint8Array(buffer), {
+        mergePages: false,
       });
-      const cleaned = text.replace(/\s+\n/g, "\n").trim();
+      const formattedPages = pages
+        .map((pageText, idx) => {
+          const clean = pageText.replace(/\s+\n/g, "\n").trim();
+          return clean ? `[Page ${idx + 1}]\n${clean}` : "";
+        })
+        .filter(Boolean);
+      const cleaned = formattedPages.join("\n\n").trim();
       return cleaned ? cleaned.slice(0, MAX_EXTRACTED_CHARS) : null;
     }
 
@@ -59,7 +65,8 @@ export async function extractTextFromBuffer(
         .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 
       const slides: string[] = [];
-      for (const slidePath of slideFiles) {
+      for (let i = 0; i < slideFiles.length; i++) {
+        const slidePath = slideFiles[i];
         const xml = await zip.files[slidePath].async("string");
         const matches = xml.match(/<a:t[^>]*>([\s\S]*?)<\/a:t>/g) || [];
         const slideText = matches
@@ -67,7 +74,7 @@ export async function extractTextFromBuffer(
           .filter(Boolean)
           .join(" ");
         if (slideText) {
-          slides.push(slideText);
+          slides.push(`[Slide ${i + 1}]\n${slideText}`);
         }
       }
       const joined = slides.join("\n\n").trim();

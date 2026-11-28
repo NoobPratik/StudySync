@@ -49,6 +49,11 @@ import {
 import { cn, formatDate, formatFileSize } from "@/lib/utils";
 import { useElapsedSeconds } from "@/hooks/use-elapsed-timer";
 import { StudyHeroEmblem } from "@/components/ui/study-emblem";
+import { AiLogsButton } from "@/components/ui/ai-logs-dialog";
+import {
+  useBackgroundAi,
+  useBackgroundExtraction,
+} from "@/components/background-extraction-provider";
 
 interface Subject {
   id: string;
@@ -145,9 +150,11 @@ export default function NotesPage() {
   const [creatingSubjects, setCreatingSubjects] = useState(false);
 
   // AI loading flags
+  const { startBatchExtraction, startExtraction, isRunning: isExtractingAny } =
+    useBackgroundExtraction();
+  const { startAiTask } = useBackgroundAi();
   const [categorizing, setCategorizing] = useState(false);
-  const [extractingNoteId, setExtractingNoteId] = useState<string | null>(null);
-  const aiElapsed = useElapsedSeconds(categorizing || Boolean(extractingNoteId));
+  const aiElapsed = useElapsedSeconds(categorizing);
 
   const loadData = useCallback(async () => {
     try {
@@ -312,30 +319,23 @@ export default function NotesPage() {
       }
 
       if (uploadedForExtraction.length > 0) {
-        let totalAddedTopics = 0;
-        for (let i = 0; i < uploadedForExtraction.length; i++) {
-          const target = uploadedForExtraction[i];
-          setUploadProgress({
-            done: i,
-            total: uploadedForExtraction.length,
-            stage: `AI extracting topics: ${target.title}...`,
-          });
-          const exRes = await fetch("/api/ai/notes/extract-topics", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              noteId: target.id,
-              subjectId: target.subjectId,
-            }),
-          }).catch(() => null);
-          if (exRes?.ok) {
-            const exJson = await exRes.json().catch(() => ({}));
-            totalAddedTopics += exJson.addedTopicsCount || 0;
-          }
-        }
+        const subjectMap = new Map(subjects.map((s) => [s.id, s.name]));
+        const queueReqs = uploadedForExtraction.map((target) => ({
+          noteId: target.id,
+          noteTitle: target.title,
+          subjectId: target.subjectId,
+          subjectName: subjectMap.get(target.subjectId) || "Subject",
+          replaceExisting: false,
+        }));
         toast.success(
-          `Uploaded ${succeeded} file(s) & auto-extracted +${totalAddedTopics} core topic(s)!`,
+          `Uploaded ${succeeded} file(s)! Topic extraction queued in background.`,
         );
+        setUploadDialogOpen(false);
+        setUploadQueue([]);
+        setBulkSubjectId("NONE");
+        loadData();
+        startBatchExtraction(queueReqs);
+        return;
       } else if (succeeded > 0) {
         toast.success(
           `Uploaded & indexed ${succeeded}/${uploadQueue.length} file(s)!`,
@@ -439,86 +439,70 @@ export default function NotesPage() {
   async function handleAiCategorize() {
     setCategorizing(true);
     try {
-      const res = await fetch("/api/ai/notes/categorize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
+      await startAiTask({
+        id: "notes-categorize",
+        feature: "notes_categorize",
+        title: "AI Notes Categorizer",
+        subtitle: "Matching uncategorized notes to subjects...",
+        actionLabel: "Open Notes",
+        actionHref: "/notes",
+        run: async (signal) => {
+          const res = await fetch("/api/ai/notes/categorize", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            signal,
+            body: JSON.stringify({}),
+          });
+          const json = await res.json();
+          if (!res.ok) throw new Error(json.error || "Categorization failed");
+          return json as { updatedCount: number };
+        },
+        onComplete: (json) => {
+          toast.success(
+            json.updatedCount > 0
+              ? `AI categorized ${json.updatedCount} note(s) into subjects!`
+              : "No uncategorized notes matched your subjects",
+          );
+          loadData();
+        },
       });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "Categorization failed");
-      toast.success(
-        json.updatedCount > 0
-          ? `AI categorized ${json.updatedCount} note(s) into subjects!`
-          : "No uncategorized notes matched your subjects",
-      );
-      loadData();
-    } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : "AI auto-categorize failed",
-      );
     } finally {
       setCategorizing(false);
     }
   }
 
-  async function handleExtractTopics(note: NoteItem) {
+  function handleExtractTopics(note: NoteItem) {
     if (!note.subjectId) {
       toast.info(
         "Assign this note to a Subject column first, then extract topics.",
       );
       return;
     }
-    setExtractingNoteId(note.id);
-    try {
-      const res = await fetch("/api/ai/notes/extract-topics", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ noteId: note.id, subjectId: note.subjectId }),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "Extraction failed");
-      const parts: string[] = [];
-      if (json.createdModulesCount > 0)
-        parts.push(`${json.createdModulesCount} new module(s)`);
-      if (json.updatedModulesCount > 0)
-        parts.push(`merged into ${json.updatedModulesCount} existing module(s)`);
-      toast.success(
-        `${parts.join(" & ") || "Processed"} in ${json.subjectName}: +${json.addedTopicsCount ?? 0} topics${json.skippedDuplicatesCount ? ` (${json.skippedDuplicatesCount} duplicates skipped)` : ""}`,
-      );
-    } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : "Topic extraction failed",
-      );
-    } finally {
-      setExtractingNoteId(null);
-    }
+    startExtraction({
+      noteId: note.id,
+      noteTitle: note.title,
+      subjectId: note.subjectId,
+      subjectName: note.subject?.name || "Subject",
+      replaceExisting: false,
+    });
   }
 
-  const kanbanColumns = useMemo(() => {
-    const cols: Array<{
-      id: string;
-      name: string;
-      code?: string | null;
-      color: string;
-      items: NoteItem[];
-    }> = subjects.map((s) => ({
-      id: s.id,
-      name: s.name,
-      code: s.code,
-      color: s.color,
-      items: sortAlphabetically(notes.filter((n) => n.subjectId === s.id)),
-    }));
+  const unassignedNotes = useMemo(
+    () => sortAlphabetically(notes.filter((n) => !n.subjectId)),
+    [notes],
+  );
 
-    const unassigned = sortAlphabetically(notes.filter((n) => !n.subjectId));
-    cols.unshift({
-      id: "NONE",
-      name: "Inbox / Uncategorized",
-      code: null,
-      color: "#6B7280",
-      items: unassigned,
-    });
-    return cols;
-  }, [subjects, notes]);
+  const subjectColumns = useMemo(
+    () =>
+      subjects.map((s) => ({
+        id: s.id,
+        name: s.name,
+        code: s.code,
+        color: s.color,
+        items: sortAlphabetically(notes.filter((n) => n.subjectId === s.id)),
+      })),
+    [subjects, notes],
+  );
 
   return (
     <div className="space-y-6">
@@ -539,6 +523,7 @@ export default function NotesPage() {
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
+          <AiLogsButton />
           <Button
             variant="outline"
             size="sm"
@@ -655,187 +640,325 @@ export default function NotesPage() {
           ))}
         </div>
       ) : viewMode === "KANBAN" ? (
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 items-start">
-          {kanbanColumns.map((col) => (
-            <div
-              key={col.id}
-              onDragOver={(e) => {
-                if (!draggedNoteId && !e.dataTransfer.types.includes("Files"))
-                  return;
-                e.preventDefault();
-                setDropTargetCol(col.id);
-              }}
-              onDragLeave={() => setDropTargetCol(null)}
-              onDrop={(e) => {
-                e.preventDefault();
-                setDropTargetCol(null);
-                if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-                  handleFilesSelected(e.dataTransfer.files, col.id);
-                } else if (draggedNoteId) {
-                  moveNoteToSubject(
-                    draggedNoteId,
-                    col.id === "NONE" ? null : col.id,
-                  );
-                  setDraggedNoteId(null);
-                }
-              }}
-              className={cn(
-                "glass-card p-4 space-y-3 min-h-[220px] transition-all",
-                dropTargetCol === col.id &&
-                  "border-primary bg-primary/10 glow-purple",
-              )}
-            >
-              <div className="flex items-center justify-between gap-2 pb-2.5 border-b border-glass-border/60">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span
-                    className="h-3 w-3 rounded-full shrink-0"
-                    style={{ backgroundColor: col.color }}
-                  />
-                  <h3 className="font-semibold text-sm truncate text-foreground">
-                    {col.name}
-                  </h3>
-                  <Badge variant="outline" className="text-[10px] shrink-0">
-                    {col.items.length}
-                  </Badge>
-                </div>
+        <div className="space-y-5">
+          {/* Compact Top Inbox & Smart Drop Strip (never creates a ragged grid gap) */}
+          <div
+            onDragOver={(e) => {
+              if (!draggedNoteId && !e.dataTransfer.types.includes("Files"))
+                return;
+              e.preventDefault();
+              setDropTargetCol("NONE");
+            }}
+            onDragLeave={() => setDropTargetCol(null)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDropTargetCol(null);
+              if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                handleFilesSelected(e.dataTransfer.files, "NONE");
+              } else if (draggedNoteId) {
+                moveNoteToSubject(draggedNoteId, null);
+                setDraggedNoteId(null);
+              }
+            }}
+            className={cn(
+              "studio-shell p-4 transition-all",
+              dropTargetCol === "NONE" &&
+                "border-primary bg-primary/10 glow-purple",
+            )}
+          >
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <span className="h-2.5 w-2.5 rounded-full bg-zinc-400 shrink-0" />
+                <h3 className="font-semibold text-sm text-foreground">
+                  Inbox / Uncategorized
+                </h3>
+                <Badge variant="outline" className="text-[10px]">
+                  {unassignedNotes.length}
+                </Badge>
+                {unassignedNotes.length === 0 && (
+                  <span className="text-xs text-muted-foreground hidden sm:inline">
+                    — Drag files here or drop directly onto any Subject vault below
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                {unassignedNotes.length > 0 && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs"
+                    onClick={handleAiCategorize}
+                    disabled={categorizing}
+                  >
+                    <Wand2 className="h-3 w-3 text-primary" />
+                    {categorizing ? `Sorting (${aiElapsed}s)` : "Auto-Sort"}
+                  </Button>
+                )}
                 <Button
+                  type="button"
+                  size="sm"
                   variant="ghost"
-                  size="icon"
-                  className="h-7 w-7 shrink-0"
-                  onClick={() => openUploadWithSubject(col.id)}
-                  title={`Bulk upload to ${col.name}`}
+                  className="h-7 text-xs"
+                  onClick={() => openUploadWithSubject("NONE")}
                 >
-                  <Plus className="h-4 w-4" />
+                  <Plus className="h-3.5 w-3.5" /> Add to Inbox
                 </Button>
               </div>
-
-              {col.items.length === 0 ? (
-                <div className="rounded-lg border border-dashed border-glass-border/60 p-5 text-center text-xs text-muted-foreground">
-                  Drop files here or click + to bulk upload
-                </div>
-              ) : (
-                <div className="space-y-2 max-h-[380px] overflow-y-auto pr-1">
-                  {col.items.map((note) => {
-                    const Icon = getFileIcon(note.fileType, note.fileName);
-                    const canPreview =
-                      note.fileType.includes("pdf") ||
-                      note.fileType.includes("image") ||
-                      note.fileType.includes("text");
-                    const isExtracting = extractingNoteId === note.id;
-
-                    return (
-                      <div
-                        key={note.id}
-                        draggable
-                        onDragStart={() => setDraggedNoteId(note.id)}
-                        onDragEnd={() => {
-                          setDraggedNoteId(null);
-                          setDropTargetCol(null);
-                        }}
-                        className="rounded-xl border border-glass-border/70 bg-muted/45 p-3 space-y-2 hover:border-primary/40 transition-colors cursor-grab active:cursor-grabbing"
-                      >
-                        <div className="flex items-start gap-2.5 min-w-0">
-                          <GripVertical className="h-4 w-4 text-muted-foreground/60 mt-0.5 shrink-0" />
-                          <Icon className="h-4 w-4 text-primary mt-0.5 shrink-0" />
-                          <div className="min-w-0">
-                            <p className="text-sm font-medium text-foreground truncate">
-                              {note.title}
-                            </p>
-                            <p className="text-[11px] text-muted-foreground truncate">
-                              {formatFileSize(note.fileSize)} •{" "}
-                              {formatDate(note.uploadedAt)}
-                            </p>
-                          </div>
-                        </div>
-
-                        <div className="flex items-center justify-between pt-1">
-                          {note.subjectId ? (
-                            <button
-                              onClick={() => handleExtractTopics(note)}
-                              disabled={Boolean(extractingNoteId)}
-                              className="inline-flex items-center gap-1 text-[11px] text-accent hover:text-primary transition-colors cursor-pointer"
-                              title="AI: Extract Modules & Topics into Progress Tracker"
-                            >
-                              {isExtracting ? (
-                                <>
-                                  <Loader2 className="h-3 w-3 animate-spin" />
-                                  Extracting ({aiElapsed}s)
-                                </>
-                              ) : (
-                                <>
-                                  <Sparkles className="h-3 w-3" />
-                                  Extract Topics
-                                </>
-                              )}
-                            </button>
-                          ) : (
-                            <span className="text-[11px] text-muted-foreground">
-                              Drag to a subject
-                            </span>
-                          )}
-
-                          <div className="flex items-center gap-0.5">
-                            {canPreview && (
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-7 w-7"
-                                asChild
-                              >
-                                <a
-                                  href={`/api/notes/${note.id}/download?inline=1`}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  title="Preview"
-                                >
-                                  <ExternalLink className="h-3.5 w-3.5" />
-                                </a>
-                              </Button>
-                            )}
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-7 w-7"
-                              asChild
-                            >
-                              <a
-                                href={`/api/notes/${note.id}/download`}
-                                title="Download"
-                              >
-                                <Download className="h-3.5 w-3.5" />
-                              </a>
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-7 w-7"
-                              onClick={() => {
-                                setEditingNote(note);
-                                setEditTitle(note.title);
-                                setEditSubjectId(note.subjectId || "NONE");
-                              }}
-                              title="Rename / Move"
-                            >
-                              <Edit2 className="h-3.5 w-3.5" />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-7 w-7 text-destructive hover:text-destructive"
-                              onClick={() => handleDelete(note.id)}
-                              title="Delete"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </Button>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
             </div>
-          ))}
+
+            {unassignedNotes.length > 0 && (
+              <div className="mt-3 pt-3 border-t border-glass-border/50 flex flex-wrap gap-2">
+                {unassignedNotes.map((note) => {
+                  const Icon = getFileIcon(note.fileType, note.fileName);
+                  return (
+                    <div
+                      key={note.id}
+                      draggable
+                      onDragStart={() => setDraggedNoteId(note.id)}
+                      onDragEnd={() => {
+                        setDraggedNoteId(null);
+                        setDropTargetCol(null);
+                      }}
+                      className="inline-flex items-center gap-2 rounded-xl border border-glass-border/80 bg-muted/45 px-3 py-1.5 text-xs cursor-grab active:cursor-grabbing hover:border-primary/45 transition-colors max-w-full"
+                    >
+                      <GripVertical className="h-3.5 w-3.5 text-muted-foreground/60 shrink-0" />
+                      <Icon className="h-3.5 w-3.5 text-primary shrink-0" />
+                      <span className="font-medium truncate max-w-[180px]">
+                        {note.title}
+                      </span>
+                      <span className="text-[10px] text-muted-foreground shrink-0">
+                        {formatFileSize(note.fileSize)}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingNote(note);
+                          setEditTitle(note.title);
+                          setEditSubjectId("NONE");
+                        }}
+                        className="text-muted-foreground hover:text-foreground cursor-pointer p-0.5"
+                        title="Assign subject"
+                      >
+                        <Edit2 className="h-3 w-3" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDelete(note.id)}
+                        className="text-muted-foreground hover:text-destructive cursor-pointer p-0.5"
+                        title="Delete"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Uniform Symmetrical Subject Vault Grid */}
+          {subjectColumns.length === 0 ? (
+            <Card className="p-10 text-center space-y-3">
+              <FolderPlus className="h-9 w-9 text-muted-foreground mx-auto" />
+              <div className="space-y-1">
+                <h3 className="text-base font-semibold">No subject vaults yet</h3>
+                <p className="text-xs text-muted-foreground">
+                  Add your semester subjects to organize PDFs and extract chronological module topics.
+                </p>
+              </div>
+            </Card>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5 items-stretch">
+              {subjectColumns.map((col) => (
+                <div
+                  key={col.id}
+                  onDragOver={(e) => {
+                    if (!draggedNoteId && !e.dataTransfer.types.includes("Files"))
+                      return;
+                    e.preventDefault();
+                    setDropTargetCol(col.id);
+                  }}
+                  onDragLeave={() => setDropTargetCol(null)}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setDropTargetCol(null);
+                    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                      handleFilesSelected(e.dataTransfer.files, col.id);
+                    } else if (draggedNoteId) {
+                      moveNoteToSubject(draggedNoteId, col.id);
+                      setDraggedNoteId(null);
+                    }
+                  }}
+                  className={cn(
+                    "studio-shell flex flex-col h-[370px] transition-all",
+                    dropTargetCol === col.id &&
+                      "border-primary bg-primary/10 glow-purple",
+                  )}
+                >
+                  {/* Colored Top Header Strip */}
+                  <div
+                    className="px-4 py-3 border-b border-glass-border/60 flex items-center justify-between gap-2 shrink-0"
+                    style={{
+                      background: `linear-gradient(90deg, ${col.color}18 0%, transparent 80%)`,
+                    }}
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <span
+                        className="h-3 w-3 rounded-full shrink-0 shadow-sm"
+                        style={{ backgroundColor: col.color }}
+                      />
+                      <h3 className="font-semibold text-sm truncate text-foreground">
+                        {col.name}
+                      </h3>
+                      <Badge variant="outline" className="text-[10px] shrink-0">
+                        {col.items.length}
+                      </Badge>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 shrink-0"
+                      onClick={() => openUploadWithSubject(col.id)}
+                      title={`Upload to ${col.name}`}
+                    >
+                      <Plus className="h-4 w-4" />
+                    </Button>
+                  </div>
+
+                  {/* Fixed-Height Scrollable Notes List */}
+                  <div className="flex-1 overflow-y-auto p-3.5 space-y-2.5 min-h-0">
+                    {col.items.length === 0 ? (
+                      <button
+                        type="button"
+                        onClick={() => openUploadWithSubject(col.id)}
+                        className="w-full h-full min-h-[200px] rounded-xl border border-dashed border-glass-border/60 p-5 flex flex-col items-center justify-center text-center text-xs text-muted-foreground hover:border-primary/45 hover:text-foreground transition-colors cursor-pointer gap-2"
+                      >
+                        <Upload className="h-5 w-5 text-primary/70" />
+                        <span>Drop PDFs / notes here or click to upload</span>
+                      </button>
+                    ) : (
+                      col.items.map((note) => {
+                        const Icon = getFileIcon(note.fileType, note.fileName);
+                        const canPreview =
+                          note.fileType.includes("pdf") ||
+                          note.fileType.includes("image") ||
+                          note.fileType.includes("text");
+
+                        return (
+                          <div
+                            key={note.id}
+                            draggable
+                            onDragStart={() => setDraggedNoteId(note.id)}
+                            onDragEnd={() => {
+                              setDraggedNoteId(null);
+                              setDropTargetCol(null);
+                            }}
+                            className="rounded-xl border border-glass-border/70 bg-muted/40 p-3 space-y-2 hover:border-primary/40 transition-colors cursor-grab active:cursor-grabbing"
+                          >
+                            <div className="flex items-start gap-2.5 min-w-0">
+                              <GripVertical className="h-4 w-4 text-muted-foreground/60 mt-0.5 shrink-0" />
+                              <Icon className="h-4 w-4 text-primary mt-0.5 shrink-0" />
+                              <div className="min-w-0 flex-1">
+                                <p className="text-sm font-medium text-foreground truncate">
+                                  {note.title}
+                                </p>
+                                <p className="text-[11px] text-muted-foreground truncate">
+                                  {formatFileSize(note.fileSize)} •{" "}
+                                  {formatDate(note.uploadedAt)}
+                                </p>
+                              </div>
+                            </div>
+
+                            <div className="flex items-center justify-between pt-1.5 border-t border-glass-border/40">
+                              <button
+                                onClick={() => handleExtractTopics(note)}
+                                disabled={isExtractingAny}
+                                className="inline-flex items-center gap-1 text-[11px] font-medium text-accent hover:text-primary transition-colors cursor-pointer disabled:opacity-50"
+                                title="AI: Extract Modules & Topics into Progress Tracker"
+                              >
+                                <Sparkles className="h-3 w-3" />
+                                Extract Topics
+                              </button>
+
+                              <div className="flex items-center gap-0.5">
+                                {canPreview && (
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-7 w-7"
+                                    asChild
+                                  >
+                                    <a
+                                      href={`/api/notes/${note.id}/download?inline=1`}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      title="Preview"
+                                    >
+                                      <ExternalLink className="h-3.5 w-3.5" />
+                                    </a>
+                                  </Button>
+                                )}
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-7 w-7"
+                                  asChild
+                                >
+                                  <a
+                                    href={`/api/notes/${note.id}/download`}
+                                    title="Download"
+                                  >
+                                    <Download className="h-3.5 w-3.5" />
+                                  </a>
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-7 w-7"
+                                  onClick={() => {
+                                    setEditingNote(note);
+                                    setEditTitle(note.title);
+                                    setEditSubjectId(note.subjectId || "NONE");
+                                  }}
+                                  title="Rename / Move"
+                                >
+                                  <Edit2 className="h-3.5 w-3.5" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-7 w-7 text-destructive hover:text-destructive"
+                                  onClick={() => handleDelete(note.id)}
+                                  title="Delete"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </Button>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  {/* Subtle Footer Strip */}
+                  <div className="px-4 py-2 border-t border-glass-border/45 bg-muted/15 flex items-center justify-between text-[11px] text-muted-foreground shrink-0">
+                    <span className="truncate">
+                      {col.code ? col.code : "Drop PDFs to upload"}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => openUploadWithSubject(col.id)}
+                      className="text-accent hover:text-primary cursor-pointer font-medium"
+                    >
+                      + Upload
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       ) : (
         <div className="space-y-4">
@@ -915,12 +1038,10 @@ export default function NotesPage() {
                         size="sm"
                         className="text-xs text-accent h-7 px-2"
                         onClick={() => handleExtractTopics(note)}
-                        disabled={Boolean(extractingNoteId)}
+                        disabled={isExtractingAny}
                       >
                         <Sparkles className="h-3 w-3" />
-                        {extractingNoteId === note.id
-                          ? `Extracting (${aiElapsed}s)`
-                          : "Extract Topics"}
+                        Extract Topics
                       </Button>
                       <div className="flex items-center gap-1">
                         <Button variant="ghost" size="icon" className="h-7 w-7" asChild>

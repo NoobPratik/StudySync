@@ -31,6 +31,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { signOut, useSession } from "@/lib/auth-client";
+import { AiLogsButton } from "@/components/ui/ai-logs-dialog";
 
 const AI_PRESETS = [
   {
@@ -215,6 +216,7 @@ export default function SettingsPage() {
       setHasApiKey(Boolean(json.config?.hasApiKey));
       setMaskedApiKey(json.config?.maskedApiKey || "");
       setApiKey("");
+      window.dispatchEvent(new CustomEvent("ai-config-updated"));
       toast.success("AI multi-model configuration saved");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to save AI config");
@@ -668,6 +670,11 @@ export default function SettingsPage() {
                   </>
                 )}
               </Button>
+              <AiLogsButton
+                size="default"
+                label="Inspect AI Logs"
+                forceVisible={debugMode}
+              />
             </div>
           </form>
         </CardContent>

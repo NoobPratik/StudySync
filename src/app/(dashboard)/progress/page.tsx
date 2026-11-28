@@ -19,9 +19,21 @@ import {
   ChevronsDownUp,
   ChevronsUpDown,
   Bot,
+  ArrowUp,
+  ArrowDown,
+  Pencil,
+  Check,
+  X,
+  Wand2,
 } from "lucide-react";
-import { StudyHeroEmblem, OrbitalIllustration } from "@/components/ui/study-emblem";
+import {
+  StudyHeroEmblem,
+  OrbitalIllustration,
+} from "@/components/ui/study-emblem";
 import { AiDebugPanel } from "@/components/ui/ai-debug-panel";
+import { AiLogsButton } from "@/components/ui/ai-logs-dialog";
+import { TopicExtractionModal } from "@/components/topic-extraction-modal";
+import { useBackgroundAi } from "@/components/background-extraction-provider";
 import { readSseStream } from "@/lib/sse-client";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -46,12 +58,16 @@ import { cn, formatDate } from "@/lib/utils";
 interface TopicItem {
   id: string;
   name: string;
+  order: number;
   isCompleted: boolean;
+  startPage?: number | null;
+  endPage?: number | null;
 }
 
 interface ModuleItem {
   id: string;
   name: string;
+  order: number;
   topics: TopicItem[];
 }
 
@@ -62,6 +78,13 @@ interface SubjectItem {
   semester: string | null;
   color: string;
   modules: ModuleItem[];
+}
+
+interface NoteSummary {
+  id: string;
+  subjectId: string | null;
+  title: string;
+  fileName: string;
 }
 
 const SUBJECT_COLORS = [
@@ -76,6 +99,7 @@ const SUBJECT_COLORS = [
 export default function ProgressPage() {
   const router = useRouter();
   const [subjects, setSubjects] = useState<SubjectItem[]>([]);
+  const [notes, setNotes] = useState<NoteSummary[]>([]);
   const [semesterEndDate, setSemesterEndDate] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [expandedSubjects, setExpandedSubjects] = useState<
@@ -88,6 +112,10 @@ export default function ProgressPage() {
     "ALL" | "REMAINING" | "COMPLETED"
   >("ALL");
   const [nowMs, setNowMs] = useState<number>(0);
+
+  // Inline topic rename
+  const [editingTopicId, setEditingTopicId] = useState<string | null>(null);
+  const [editingTopicName, setEditingTopicName] = useState("");
 
   // Subject Modal
   const [subjectModal, setSubjectModal] = useState(false);
@@ -107,6 +135,9 @@ export default function ProgressPage() {
   );
   const [topicInput, setTopicInput] = useState("");
 
+  // Extract from Notes Modal
+  const [extractSubject, setExtractSubject] = useState<SubjectItem | null>(null);
+
   // Target Date Modal
   const [targetModalOpen, setTargetModalOpen] = useState(false);
   const [targetDateInput, setTargetDateInput] = useState("");
@@ -119,6 +150,7 @@ export default function ProgressPage() {
   const [planDebugMode, setPlanDebugMode] = useState(false);
   const [planModel, setPlanModel] = useState("");
   const planElapsed = useElapsedSeconds(planLoading);
+  const { upsertExternalTask } = useBackgroundAi();
 
   const syncExpansionDefaults = useCallback((list: SubjectItem[]) => {
     setExpandedSubjects((prev) => {
@@ -135,7 +167,6 @@ export default function ProgressPage() {
           if (next[m.id] === undefined) {
             const allDone =
               m.topics.length > 0 && m.topics.every((t) => t.isCompleted);
-            // Auto-collapse fully completed modules so active modules stay prominent
             next[m.id] = !allDone;
           }
         }
@@ -146,9 +177,10 @@ export default function ProgressPage() {
 
   const loadData = useCallback(async () => {
     try {
-      const [sRes, pRes] = await Promise.all([
+      const [sRes, pRes, nRes] = await Promise.all([
         fetch("/api/subjects"),
         fetch("/api/profile"),
+        fetch("/api/notes"),
       ]);
       setNowMs(Date.now());
       if (sRes.ok) {
@@ -163,6 +195,10 @@ export default function ProgressPage() {
         setSemesterEndDate(end);
         if (end) setTargetDateInput(end.slice(0, 10));
       }
+      if (nRes.ok) {
+        const nJson = await nRes.json();
+        setNotes(nJson.notes || []);
+      }
     } catch {
       toast.error("Failed to load progress data");
     } finally {
@@ -172,8 +208,8 @@ export default function ProgressPage() {
 
   useEffect(() => {
     let active = true;
-    Promise.all([fetch("/api/subjects"), fetch("/api/profile")])
-      .then(async ([sRes, pRes]) => {
+    Promise.all([fetch("/api/subjects"), fetch("/api/profile"), fetch("/api/notes")])
+      .then(async ([sRes, pRes, nRes]) => {
         if (!active) return;
         setNowMs(Date.now());
         if (sRes.ok) {
@@ -192,6 +228,10 @@ export default function ProgressPage() {
             if (end) setTargetDateInput(end.slice(0, 10));
           }
         }
+        if (nRes.ok) {
+          const nJson = await nRes.json();
+          if (active) setNotes(nJson.notes || []);
+        }
       })
       .catch(() => {
         if (active) toast.error("Failed to load progress data");
@@ -199,10 +239,16 @@ export default function ProgressPage() {
       .finally(() => {
         if (active) setLoading(false);
       });
+
+    const onUpdated = () => {
+      loadData();
+    };
+    window.addEventListener("syllabus-updated", onUpdated);
     return () => {
       active = false;
+      window.removeEventListener("syllabus-updated", onUpdated);
     };
-  }, [syncExpansionDefaults]);
+  }, [syncExpansionDefaults, loadData]);
 
   const summary = useMemo(() => {
     let total = 0;
@@ -332,7 +378,6 @@ export default function ProgressPage() {
   }
 
   async function toggleTopic(topic: TopicItem) {
-    // Optimistic update for snappy checkbox feedback
     setSubjects((prev) =>
       prev.map((s) => ({
         ...s,
@@ -353,6 +398,72 @@ export default function ProgressPage() {
       if (!res.ok) throw new Error();
     } catch {
       toast.error("Failed to update topic");
+      loadData();
+    }
+  }
+
+  async function saveTopicRename(topicId: string) {
+    const clean = editingTopicName.trim();
+    if (!clean) return;
+    try {
+      const res = await fetch(`/api/topics/${topicId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: clean }),
+      });
+      if (!res.ok) throw new Error();
+      setSubjects((prev) =>
+        prev.map((s) => ({
+          ...s,
+          modules: s.modules.map((m) => ({
+            ...m,
+            topics: m.topics.map((t) =>
+              t.id === topicId ? { ...t, name: clean } : t,
+            ),
+          })),
+        })),
+      );
+      setEditingTopicId(null);
+      toast.success("Topic updated");
+    } catch {
+      toast.error("Failed to rename topic");
+    }
+  }
+
+  async function moveTopic(
+    mod: ModuleItem,
+    topicIndex: number,
+    direction: -1 | 1,
+  ) {
+    const targetIdx = topicIndex + direction;
+    if (targetIdx < 0 || targetIdx >= mod.topics.length) return;
+
+    const reordered = [...mod.topics];
+    const [item] = reordered.splice(topicIndex, 1);
+    reordered.splice(targetIdx, 0, item);
+    const updatedTopics = reordered.map((t, idx) => ({ ...t, order: idx }));
+
+    setSubjects((prev) =>
+      prev.map((s) => ({
+        ...s,
+        modules: s.modules.map((m) =>
+          m.id === mod.id ? { ...m, topics: updatedTopics } : m,
+        ),
+      })),
+    );
+
+    try {
+      const res = await fetch("/api/topics/reorder", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          moduleId: mod.id,
+          topicIds: updatedTopics.map((t) => t.id),
+        }),
+      });
+      if (!res.ok) throw new Error();
+    } catch {
+      toast.error("Failed to reorder topic");
       loadData();
     }
   }
@@ -431,14 +542,31 @@ export default function ProgressPage() {
   }
 
   async function generateStudyPlan() {
+    const ac = new AbortController();
     setPlanOpen(true);
     setPlanLoading(true);
     setPlanContent("");
     setPlanThinking("");
+
+    const taskId = "study-plan-gen";
+    upsertExternalTask(
+      {
+        id: taskId,
+        feature: "study_plan",
+        title: "7-Day AI Study Plan",
+        subtitle: "Calculating optimal topic schedule...",
+        status: "running",
+        actionLabel: "Open Plan",
+        onOpenResult: () => setPlanOpen(true),
+      },
+      () => ac.abort(),
+    );
+
     try {
       const res = await fetch("/api/ai/study-plan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: ac.signal,
         body: JSON.stringify({ stream: true }),
       });
       if (!res.ok) {
@@ -457,15 +585,41 @@ export default function ProgressPage() {
         onToken: (tok) => setPlanContent((p) => p + tok),
         onDone: (done) => {
           if (done.plan) setPlanContent(done.plan);
+          upsertExternalTask({
+            id: taskId,
+            feature: "study_plan",
+            title: "7-Day AI Study Plan",
+            subtitle: "Study plan ready",
+            status: "done",
+            actionLabel: "Open Plan",
+            onOpenResult: () => setPlanOpen(true),
+          });
         },
       });
     } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : "Could not generate study plan",
-      );
-      setPlanContent(
-        `Error: ${err instanceof Error ? err.message : "Configure AI in Settings first."}`,
-      );
+      if (err instanceof Error && err.name === "AbortError") {
+        upsertExternalTask({
+          id: taskId,
+          feature: "study_plan",
+          title: "7-Day AI Study Plan",
+          subtitle: "Stopped by user",
+          status: "stopped",
+        });
+        toast.info("Study plan generation stopped");
+      } else {
+        const msg =
+          err instanceof Error ? err.message : "Could not generate study plan";
+        upsertExternalTask({
+          id: taskId,
+          feature: "study_plan",
+          title: "7-Day AI Study Plan",
+          subtitle: "Failed",
+          status: "error",
+          errorText: msg,
+        });
+        toast.error(msg);
+        setPlanContent(`Error: ${msg}`);
+      }
     } finally {
       setPlanLoading(false);
     }
@@ -509,15 +663,31 @@ export default function ProgressPage() {
     }
   }
 
-  function explainTopicWithAi(subjectName: string, moduleName: string, topicName: string) {
+  function explainTopicWithAi(
+    subjectId: string,
+    moduleId: string,
+    topicId: string,
+  ) {
     const params = new URLSearchParams({
-      auto: "1",
-      subject: subjectName,
-      module: moduleName,
-      topic: topicName,
+      study: "1",
+      subjectId,
+      moduleId,
+      topicId,
     });
     router.push(`/chat?${params.toString()}`);
   }
+
+  function openExtractModal(sub: SubjectItem) {
+    setExtractSubject(sub);
+  }
+
+  const subjectNotesForModal = useMemo(
+    () =>
+      extractSubject
+        ? notes.filter((n) => n.subjectId === extractSubject.id)
+        : [],
+    [extractSubject, notes],
+  );
 
   return (
     <div className="space-y-6">
@@ -527,16 +697,21 @@ export default function ProgressPage() {
         className="flex flex-col sm:flex-row sm:items-center justify-between gap-4"
       >
         <div>
-          <StudyHeroEmblem icon={BookOpen} eyebrow="Syllabus Mastery" accentColor="violet" />
+          <StudyHeroEmblem
+            icon={BookOpen}
+            eyebrow="Sequential Syllabus Mastery"
+            accentColor="violet"
+          />
           <h1 className="text-2xl sm:text-3xl font-bold">
-            Syllabus <span className="gradient-text">Progress & Pacing</span>
+            Syllabus <span className="gradient-text">Progress &amp; Study Flow</span>
           </h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Clean collapsible modules with readable checklists and daily pace
-            tracking
+            Chronological module checklists synced directly to your course PDFs
+            and AI Tutor
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
+          <AiLogsButton />
           <Button variant="outline" size="sm" onClick={generateStudyPlan}>
             <Sparkles className="h-4 w-4 text-primary" />
             AI Study Plan
@@ -560,18 +735,18 @@ export default function ProgressPage() {
 
       {/* Pacing Balance Card */}
       <Card className="gradient-border">
-        <CardContent className="pt-0 grid grid-cols-1 md:grid-cols-4 gap-6 items-center">
+        <CardContent className="pt-0 grid grid-cols-2 md:grid-cols-4 gap-4 sm:gap-6 items-center">
           <div className="space-y-1">
             <div className="flex items-center gap-2 text-xs text-accent font-medium">
               <Sparkles className="h-3.5 w-3.5 text-primary" /> Overall Mastery
             </div>
-            <p className="text-3xl font-bold">{summary.percentage}%</p>
+            <p className="text-2xl sm:text-3xl font-bold">{summary.percentage}%</p>
             <Progress value={summary.percentage} className="mt-2" />
           </div>
 
           <div>
             <p className="text-xs text-muted-foreground">Topics Covered</p>
-            <p className="text-2xl font-bold mt-1">
+            <p className="text-xl sm:text-2xl font-bold mt-1">
               {summary.completed}{" "}
               <span className="text-sm font-normal text-muted-foreground">
                 / {summary.total}
@@ -584,7 +759,7 @@ export default function ProgressPage() {
 
           <div>
             <p className="text-xs text-muted-foreground">Days Remaining</p>
-            <p className="text-2xl font-bold mt-1">
+            <p className="text-xl sm:text-2xl font-bold mt-1">
               {summary.daysLeft !== null ? summary.daysLeft : "—"}
             </p>
             <button
@@ -597,13 +772,13 @@ export default function ProgressPage() {
 
           <div>
             <p className="text-xs text-muted-foreground">Required Pace</p>
-            <p className="text-2xl font-bold mt-1 text-accent">
+            <p className="text-xl sm:text-2xl font-bold mt-1 text-accent">
               {summary.pacePerDay !== null
                 ? `${summary.pacePerDay} / day`
                 : "Set Date"}
             </p>
             <p className="text-xs text-muted-foreground mt-1">
-              topics per day to finish on time
+              topics/day to finish on time
             </p>
           </div>
         </CardContent>
@@ -612,7 +787,7 @@ export default function ProgressPage() {
       {/* Filter & Collapse Toolbar */}
       {subjects.length > 0 && (
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 flex-wrap">
             {(
               [
                 { id: "ALL", label: "All Topics" },
@@ -635,11 +810,7 @@ export default function ProgressPage() {
             ))}
           </div>
           <div className="flex items-center gap-2 flex-wrap">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={toggleAllSubjects}
-            >
+            <Button variant="outline" size="sm" onClick={toggleAllSubjects}>
               {anySubjectExpanded ? (
                 <>
                   <ChevronsDownUp className="h-3.5 w-3.5" /> Collapse Subjects
@@ -650,11 +821,7 @@ export default function ProgressPage() {
                 </>
               )}
             </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={toggleAllModules}
-            >
+            <Button variant="outline" size="sm" onClick={toggleAllModules}>
               {anyModuleExpanded ? (
                 <>
                   <ChevronsDownUp className="h-3.5 w-3.5" /> Collapse Modules
@@ -681,8 +848,8 @@ export default function ProgressPage() {
           <OrbitalIllustration className="h-24 w-24 mx-auto animate-float" />
           <h3 className="text-lg font-semibold">No subjects created yet</h3>
           <p className="text-sm text-muted-foreground max-w-md mx-auto">
-            Add subjects here or in Notes, then click &ldquo;Extract Topics&rdquo;
-            on any uploaded PDF/PPT in Notes to auto-build modules!
+            Add subjects here or in Notes, then extract chronological topics from
+            any uploaded PDF/PPTX to build your module study path!
           </p>
           <Button onClick={() => setSubjectModal(true)}>
             <Plus className="h-4 w-4" /> Add First Subject
@@ -702,6 +869,9 @@ export default function ProgressPage() {
             const subPct =
               subTotal > 0 ? Math.round((subDone / subTotal) * 100) : 0;
             const expanded = expandedSubjects[sub.id] ?? true;
+            const subNotesCount = notes.filter(
+              (n) => n.subjectId === sub.id,
+            ).length;
 
             return (
               <Card key={sub.id} className="overflow-hidden">
@@ -717,9 +887,9 @@ export default function ProgressPage() {
                       className="flex items-center gap-3 text-left cursor-pointer"
                     >
                       {expanded ? (
-                        <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                        <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0" />
                       ) : (
-                        <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                        <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" />
                       )}
                       <span
                         className="h-3.5 w-3.5 rounded-full shrink-0"
@@ -735,14 +905,28 @@ export default function ProgressPage() {
                         <p className="text-xs text-muted-foreground mt-0.5">
                           {sub.modules.length} modules • {subDone}/{subTotal}{" "}
                           topics covered ({subPct}%)
+                          {subNotesCount > 0
+                            ? ` • ${subNotesCount} note${subNotesCount > 1 ? "s" : ""}`
+                            : ""}
                         </p>
                       </div>
                     </button>
 
-                    <div className="flex items-center gap-2">
-                      <div className="w-28 hidden sm:block">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <div className="w-24 hidden lg:block">
                         <Progress value={subPct} />
                       </div>
+                      {subNotesCount > 0 && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => openExtractModal(sub)}
+                          title="Extract chronological topics from uploaded notes"
+                        >
+                          <Wand2 className="h-3.5 w-3.5 text-primary" />
+                          Extract from Notes
+                        </Button>
+                      )}
                       <Button
                         size="sm"
                         variant="outline"
@@ -766,8 +950,9 @@ export default function ProgressPage() {
                   <CardContent className="space-y-3 pt-2 border-t border-glass-border/50">
                     {sub.modules.length === 0 ? (
                       <div className="rounded-lg border border-dashed border-glass-border p-4 text-center text-xs text-muted-foreground">
-                        No modules yet. Click &ldquo;+ Module&rdquo; or extract
-                        from your uploaded notes!
+                        No modules yet. Click &ldquo;+ Module&rdquo; or
+                        &ldquo;Extract from Notes&rdquo; to build chronological
+                        topics from your PDFs!
                       </div>
                     ) : (
                       sub.modules.map((mod) => {
@@ -783,13 +968,19 @@ export default function ProgressPage() {
                           modTotal > 0 && modDone === modTotal;
                         const modExpanded = expandedModules[mod.id] ?? true;
 
-                        const visibleTopics = mod.topics.filter((t) => {
-                          if (topicFilter === "REMAINING")
-                            return !t.isCompleted;
-                          if (topicFilter === "COMPLETED")
-                            return t.isCompleted;
-                          return true;
-                        });
+                        const firstUncompletedId = mod.topics.find(
+                          (t) => !t.isCompleted,
+                        )?.id;
+
+                        const visibleTopics = mod.topics
+                          .map((t, index) => ({ topic: t, index }))
+                          .filter(({ topic }) => {
+                            if (topicFilter === "REMAINING")
+                              return !topic.isCompleted;
+                            if (topicFilter === "COMPLETED")
+                              return topic.isCompleted;
+                            return true;
+                          });
 
                         return (
                           <div
@@ -881,9 +1072,9 @@ export default function ProgressPage() {
                               </div>
                             </div>
 
-                            {/* Readable Full-Width Checklist */}
+                            {/* Sequential Chronological Checklist */}
                             {modExpanded && (
-                              <div className="px-3.5 pb-3.5 pt-1 border-t border-glass-border/40 space-y-1.5">
+                              <div className="px-3 pb-3 pt-1 border-t border-glass-border/40 space-y-1.5">
                                 {visibleTopics.length === 0 ? (
                                   <p className="text-xs text-muted-foreground py-2 pl-6">
                                     {mod.topics.length === 0
@@ -891,61 +1082,200 @@ export default function ProgressPage() {
                                       : "No topics match current filter."}
                                   </p>
                                 ) : (
-                                  visibleTopics.map((topic) => (
-                                    <div
-                                      key={topic.id}
-                                      className={cn(
-                                        "flex items-start justify-between gap-3 rounded-lg px-3 py-2.5 border transition-colors group",
-                                        topic.isCompleted
-                                          ? "bg-emerald-500/5 border-emerald-500/20"
-                                          : "bg-background/50 border-glass-border/50 hover:border-primary/40",
-                                      )}
-                                    >
-                                      <button
-                                        onClick={() => toggleTopic(topic)}
-                                        className="flex items-start gap-3 text-left flex-1 cursor-pointer min-w-0"
-                                      >
-                                        {topic.isCompleted ? (
-                                          <CheckCircle2 className="h-4.5 w-4.5 text-emerald-400 shrink-0 mt-0.5" />
-                                        ) : (
-                                          <Circle className="h-4.5 w-4.5 text-muted-foreground shrink-0 mt-0.5" />
+                                  visibleTopics.map(({ topic, index }) => {
+                                    const isNextUp =
+                                      topic.id === firstUncompletedId;
+                                    const isEditing =
+                                      editingTopicId === topic.id;
+
+                                    return (
+                                      <div
+                                        key={topic.id}
+                                        className={cn(
+                                          "flex items-start justify-between gap-2.5 rounded-lg px-2.5 sm:px-3 py-2.5 border transition-colors group",
+                                          topic.isCompleted
+                                            ? "bg-emerald-500/5 border-emerald-500/20"
+                                            : isNextUp
+                                              ? "bg-primary/5 border-primary/40"
+                                              : "bg-background/50 border-glass-border/50 hover:border-primary/40",
                                         )}
-                                        <span
-                                          className={cn(
-                                            "text-sm leading-snug break-words",
-                                            topic.isCompleted &&
-                                              "line-through text-muted-foreground",
-                                          )}
-                                        >
-                                          {topic.name}
-                                        </span>
-                                      </button>
-                                      <div className="flex items-center gap-1 shrink-0 mt-0.5">
-                                        <button
-                                          type="button"
-                                          onClick={() =>
-                                            explainTopicWithAi(
-                                              sub.name,
-                                              mod.name,
-                                              topic.name,
-                                            )
-                                          }
-                                          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium text-accent hover:text-primary hover:bg-primary/10 transition-colors cursor-pointer"
-                                          title="Explain this topic in detail in AI Tutor"
-                                        >
-                                          <Bot className="h-3 w-3" />
-                                          <span className="hidden sm:inline">Explain</span>
-                                        </button>
-                                        <button
-                                          onClick={() => deleteTopic(topic.id)}
-                                          className="opacity-0 group-hover:opacity-100 p-1 text-muted-foreground hover:text-destructive transition-opacity cursor-pointer"
-                                          title="Remove topic"
-                                        >
-                                          <Trash2 className="h-3.5 w-3.5" />
-                                        </button>
+                                      >
+                                        {isEditing ? (
+                                          <form
+                                            onSubmit={(e) => {
+                                              e.preventDefault();
+                                              saveTopicRename(topic.id);
+                                            }}
+                                            className="flex items-center gap-2 flex-1"
+                                          >
+                                            <Input
+                                              value={editingTopicName}
+                                              onChange={(e) =>
+                                                setEditingTopicName(
+                                                  e.target.value,
+                                                )
+                                              }
+                                              className="h-8 text-sm"
+                                              autoFocus
+                                            />
+                                            <Button
+                                              type="submit"
+                                              size="icon"
+                                              variant="ghost"
+                                              className="h-7 w-7 text-emerald-400"
+                                            >
+                                              <Check className="h-3.5 w-3.5" />
+                                            </Button>
+                                            <Button
+                                              type="button"
+                                              size="icon"
+                                              variant="ghost"
+                                              className="h-7 w-7"
+                                              onClick={() =>
+                                                setEditingTopicId(null)
+                                              }
+                                            >
+                                              <X className="h-3.5 w-3.5" />
+                                            </Button>
+                                          </form>
+                                        ) : (
+                                          <button
+                                            onClick={() => toggleTopic(topic)}
+                                            className="flex items-start gap-2.5 text-left flex-1 cursor-pointer min-w-0"
+                                          >
+                                            {topic.isCompleted ? (
+                                              <CheckCircle2 className="h-4.5 w-4.5 text-emerald-400 shrink-0 mt-0.5" />
+                                            ) : (
+                                              <Circle
+                                                className={cn(
+                                                  "h-4.5 w-4.5 shrink-0 mt-0.5",
+                                                  isNextUp
+                                                    ? "text-primary"
+                                                    : "text-muted-foreground",
+                                                )}
+                                              />
+                                            )}
+                                            <div className="min-w-0 flex-1">
+                                              <span
+                                                className={cn(
+                                                  "text-xs font-mono mr-2",
+                                                  isNextUp
+                                                    ? "text-primary font-semibold"
+                                                    : "text-muted-foreground",
+                                                )}
+                                              >
+                                                {index + 1}.
+                                              </span>
+                                              <span
+                                                className={cn(
+                                                  "text-sm leading-snug break-words",
+                                                  topic.isCompleted &&
+                                                    "line-through text-muted-foreground",
+                                                )}
+                                              >
+                                                {topic.name}
+                                              </span>
+                                              {topic.startPage != null && (
+                                                <span className="ml-2 text-[10px] font-mono text-muted-foreground/80">
+                                                  p.{topic.startPage}
+                                                  {topic.endPage &&
+                                                  topic.endPage !== topic.startPage
+                                                    ? `–${topic.endPage}`
+                                                    : ""}
+                                                </span>
+                                              )}
+                                              {isNextUp && (
+                                                <Badge
+                                                  variant="outline"
+                                                  className="ml-2 text-[10px] border-primary/40 text-primary align-middle"
+                                                >
+                                                  Next Up
+                                                </Badge>
+                                              )}
+                                            </div>
+                                          </button>
+                                        )}
+
+                                        {!isEditing && (
+                                          <div className="flex items-center gap-1 shrink-0 mt-0.5">
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                explainTopicWithAi(
+                                                  sub.id,
+                                                  mod.id,
+                                                  topic.id,
+                                                )
+                                              }
+                                              className={cn(
+                                                "inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors cursor-pointer",
+                                                isNextUp
+                                                  ? "bg-primary/20 text-primary hover:bg-primary/30"
+                                                  : "text-accent hover:text-primary hover:bg-primary/10",
+                                              )}
+                                              title="Explain this topic from your PDF notes"
+                                            >
+                                              <Bot className="h-3 w-3" />
+                                              <span>Explain</span>
+                                            </button>
+
+                                            {topicFilter === "ALL" && (
+                                              <div className="hidden sm:flex items-center opacity-0 group-hover:opacity-100 transition-opacity">
+                                                <button
+                                                  type="button"
+                                                  disabled={index === 0}
+                                                  onClick={() =>
+                                                    moveTopic(mod, index, -1)
+                                                  }
+                                                  className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-25 cursor-pointer"
+                                                  title="Move earlier in order"
+                                                >
+                                                  <ArrowUp className="h-3 w-3" />
+                                                </button>
+                                                <button
+                                                  type="button"
+                                                  disabled={
+                                                    index ===
+                                                    mod.topics.length - 1
+                                                  }
+                                                  onClick={() =>
+                                                    moveTopic(mod, index, 1)
+                                                  }
+                                                  className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-25 cursor-pointer"
+                                                  title="Move later in order"
+                                                >
+                                                  <ArrowDown className="h-3 w-3" />
+                                                </button>
+                                              </div>
+                                            )}
+
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                setEditingTopicId(topic.id);
+                                                setEditingTopicName(topic.name);
+                                              }}
+                                              className="hidden sm:inline-flex opacity-0 group-hover:opacity-100 p-1 text-muted-foreground hover:text-foreground transition-opacity cursor-pointer"
+                                              title="Rename topic"
+                                            >
+                                              <Pencil className="h-3 w-3" />
+                                            </button>
+
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                deleteTopic(topic.id)
+                                              }
+                                              className="sm:opacity-0 sm:group-hover:opacity-100 p-1 text-muted-foreground hover:text-destructive transition-opacity cursor-pointer"
+                                              title="Remove topic"
+                                            >
+                                              <Trash2 className="h-3.5 w-3.5" />
+                                            </button>
+                                          </div>
+                                        )}
                                       </div>
-                                    </div>
-                                  ))
+                                    );
+                                  })
                                 )}
                               </div>
                             )}
@@ -961,7 +1291,18 @@ export default function ProgressPage() {
         </div>
       )}
 
-      {/* Modals */}
+      {/* Extract Chronological Topics from Subject Notes Modal */}
+      {extractSubject && (
+        <TopicExtractionModal
+          open={Boolean(extractSubject)}
+          onOpenChange={(o) => !o && setExtractSubject(null)}
+          subjectId={extractSubject.id}
+          subjectName={extractSubject.name}
+          notes={subjectNotesForModal}
+        />
+      )}
+
+      {/* Add Subject Modal */}
       <Dialog open={subjectModal} onOpenChange={setSubjectModal}>
         <DialogContent>
           <DialogHeader>
@@ -1020,6 +1361,7 @@ export default function ProgressPage() {
         </DialogContent>
       </Dialog>
 
+      {/* Add Module Modal */}
       <Dialog
         open={Boolean(moduleTargetSubjectId)}
         onOpenChange={(o) => !o && setModuleTargetSubjectId(null)}
@@ -1054,6 +1396,7 @@ export default function ProgressPage() {
         </DialogContent>
       </Dialog>
 
+      {/* Add Topics Modal */}
       <Dialog
         open={Boolean(topicTargetModuleId)}
         onOpenChange={(o) => !o && setTopicTargetModuleId(null)}
@@ -1062,7 +1405,7 @@ export default function ProgressPage() {
           <DialogHeader>
             <DialogTitle>Add Topics</DialogTitle>
             <DialogDescription>
-              Enter one topic, or paste multiple lines at once.
+              Enter one topic per line in study order.
             </DialogDescription>
           </DialogHeader>
           <form onSubmit={createTopics} className="space-y-4">
@@ -1089,6 +1432,7 @@ export default function ProgressPage() {
         </DialogContent>
       </Dialog>
 
+      {/* Target Date Modal */}
       <Dialog open={targetModalOpen} onOpenChange={setTargetModalOpen}>
         <DialogContent>
           <DialogHeader>
@@ -1119,6 +1463,7 @@ export default function ProgressPage() {
         </DialogContent>
       </Dialog>
 
+      {/* AI Study Plan Modal */}
       <Dialog open={planOpen} onOpenChange={setPlanOpen}>
         <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
           <DialogHeader>
@@ -1142,7 +1487,9 @@ export default function ProgressPage() {
             {planLoading && !planContent ? (
               <div className="flex flex-col items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
                 <Loader2 className="h-6 w-6 animate-spin text-primary" />
-                <span>Balancing topics across remaining days... ({planElapsed}s)</span>
+                <span>
+                  Balancing topics across remaining days... ({planElapsed}s)
+                </span>
                 <span className="text-xs opacity-70">
                   Local models may take 30–120s on 8GB VRAM
                 </span>

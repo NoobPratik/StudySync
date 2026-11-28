@@ -141,6 +141,8 @@ export async function POST(request: NextRequest) {
 
             const { content, thinking, model } = await callAiChatStream({
               userId: user.id,
+              logFeature: "timetable_extract",
+              signal: request.signal,
               ...aiRequest,
               onThinking: (delta) =>
                 sendEvent(controller, "thinking", { text: delta }),
@@ -187,6 +189,8 @@ export async function POST(request: NextRequest) {
     const startedAt = Date.now();
     const { content, model } = await callAiChat({
       userId: user.id,
+      logFeature: "timetable_extract",
+      signal: request.signal,
       ...aiRequest,
     });
     const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);

@@ -9,6 +9,7 @@ export async function readSseStream<
     onToken?: (text: string) => void;
     onDone?: (data: TDone) => void;
     onError?: (message: string) => void;
+    onEvent?: (eventName: string, data: Record<string, unknown>) => void;
   },
 ): Promise<void> {
   if (!res.body) {
@@ -49,6 +50,8 @@ export async function readSseStream<
           const msg = parsed.error || "Stream failed";
           handlers.onError?.(msg);
           throw new Error(msg);
+        } else {
+          handlers.onEvent?.(eventName, parsed as Record<string, unknown>);
         }
       } catch (e) {
         if (eventName === "error") throw e;

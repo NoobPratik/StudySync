@@ -2,9 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getApiUser } from "@/lib/session";
 import {
-  buildSmartTutorContext,
+  buildCourseStudyContext,
   callAiChat,
   callAiChatStream,
+  formatMessagesForLog,
   getUserAiConfig,
 } from "@/lib/ai";
 import { AI_PROMPTS } from "@/lib/ai-prompts";
@@ -23,6 +24,7 @@ export async function POST(request: NextRequest) {
     let customQuestions = "";
     let useWebSearch = true;
     let stream = false;
+    let think = true;
     let uploadedText = "";
 
     const contentType = request.headers.get("content-type") || "";
@@ -33,6 +35,7 @@ export async function POST(request: NextRequest) {
       customQuestions = String(fd.get("questions") || "");
       useWebSearch = fd.get("useWebSearch") !== "false";
       stream = fd.get("stream") === "true";
+      think = fd.get("think") !== "false";
       const file = fd.get("file");
       if (file instanceof File && file.size > 0) {
         const buf = Buffer.from(await file.arrayBuffer());
@@ -47,6 +50,7 @@ export async function POST(request: NextRequest) {
         typeof body.questions === "string" ? body.questions : "";
       useWebSearch = body.useWebSearch !== false;
       stream = body.stream === true;
+      think = body.think !== false;
     }
 
     if (!deadlineId) {
@@ -91,16 +95,28 @@ export async function POST(request: NextRequest) {
       .filter(Boolean)
       .join(" ");
 
-    const [{ context, openedNotes }, webResults] = await Promise.all([
-      buildSmartTutorContext({
+    const [courseCtx, webResults] = await Promise.all([
+      buildCourseStudyContext({
         userId: user.id,
         query: `${deadline.title} ${effectiveQuestions} ${deadline.description || ""}`,
         subjectId: deadline.subjectId,
-        maxNoteChars: 7500,
-        includeScheduleAndDeadlines: false,
+        maxMaterialChars: 6500,
       }),
       useWebSearch ? searchWebTool(searchQuery, 5) : Promise.resolve([]),
     ]);
+
+    const openedNotes = courseCtx.openedNotes;
+    const context =
+      [
+        courseCtx.syllabusContext
+          ? `=== COURSE SYLLABUS ===\n${courseCtx.syllabusContext}`
+          : "",
+        courseCtx.materialExcerpts
+          ? `=== RELEVANT COURSE MATERIAL ===\n${courseCtx.materialExcerpts}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n") || "No matching subject notes uploaded yet.";
 
     const webBlock =
       webResults.length > 0
@@ -117,6 +133,7 @@ export async function POST(request: NextRequest) {
       effectiveQuestions,
       context,
       webBlock,
+      think,
     });
 
     const sourcesPayload = {
@@ -133,9 +150,13 @@ export async function POST(request: NextRequest) {
       const sseStream = new ReadableStream({
         async start(controller) {
           const sendEvent = (event: string, data: unknown) => {
-            controller.enqueue(
-              encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
-            );
+            try {
+              controller.enqueue(
+                encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
+              );
+            } catch {
+              // stream already closed
+            }
           };
 
           try {
@@ -145,10 +166,15 @@ export async function POST(request: NextRequest) {
               savedQuestions: effectiveQuestions,
               debugMode: cfg.debugMode,
               model: cfg.model,
+              promptPreview: cfg.debugMode
+                ? formatMessagesForLog(aiRequest.messages)
+                : undefined,
             });
 
             const { content, model } = await callAiChatStream({
               userId,
+              logFeature: `deadline_solver_${mode}`,
+              signal: request.signal,
               ...aiRequest,
               onThinking: (text) => sendEvent("thinking", { text }),
               onToken: (text) => sendEvent("token", { text }),
@@ -172,14 +198,22 @@ export async function POST(request: NextRequest) {
               savedQuestions: effectiveQuestions,
             });
           } catch (err) {
-            sendEvent("error", {
-              error:
-                err instanceof Error
-                  ? err.message
-                  : "Failed to generate assignment answer",
-            });
+            const isAbort =
+              err instanceof Error && err.name === "AbortError";
+            if (!isAbort) {
+              sendEvent("error", {
+                error:
+                  err instanceof Error
+                    ? err.message
+                    : "Failed to generate assignment answer",
+              });
+            }
           } finally {
-            controller.close();
+            try {
+              controller.close();
+            } catch {
+              // ignore double close
+            }
           }
         },
       });
@@ -195,6 +229,8 @@ export async function POST(request: NextRequest) {
 
     const { content, model } = await callAiChat({
       userId: user.id,
+      logFeature: `deadline_solver_${mode}`,
+      signal: request.signal,
       ...aiRequest,
     });
 

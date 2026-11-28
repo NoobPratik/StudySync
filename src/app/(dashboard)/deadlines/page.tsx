@@ -21,6 +21,9 @@ import {
   Globe,
   Copy,
   Check,
+  Square,
+  Brain,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Card, CardContent } from "@/components/ui/card";
@@ -47,6 +50,8 @@ import {
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { StudyHeroEmblem } from "@/components/ui/study-emblem";
 import { AiDebugPanel } from "@/components/ui/ai-debug-panel";
+import { AiLogsButton } from "@/components/ui/ai-logs-dialog";
+import { useBackgroundAi } from "@/components/background-extraction-provider";
 import { useElapsedSeconds } from "@/hooks/use-elapsed-timer";
 import { readSseStream } from "@/lib/sse-client";
 import {
@@ -157,6 +162,7 @@ export default function DeadlinesPage() {
 
   // WhatsApp Import Modal
   const waFileRef = useRef<HTMLInputElement>(null);
+  const waAbortRef = useRef<AbortController | null>(null);
   const [waOpen, setWaOpen] = useState(false);
   const [waText, setWaText] = useState("");
   const [waFile, setWaFile] = useState<File | null>(null);
@@ -168,6 +174,7 @@ export default function DeadlinesPage() {
 
   // AI Assignment Answer Solver Modal
   const assignFileRef = useRef<HTMLInputElement>(null);
+  const solverAbortRef = useRef<AbortController | null>(null);
   const [helperTarget, setHelperTarget] = useState<DeadlineItem | null>(null);
   const [helperMode, setHelperMode] = useState<
     "answer" | "project_report" | "viva_prep"
@@ -175,9 +182,11 @@ export default function DeadlinesPage() {
   const [solverQuestions, setSolverQuestions] = useState("");
   const [solverFile, setSolverFile] = useState<File | null>(null);
   const [useWebSearch, setUseWebSearch] = useState(true);
+  const [helperThink, setHelperThink] = useState(true);
   const [helperLoading, setHelperLoading] = useState(false);
   const [helperAnswer, setHelperAnswer] = useState("");
   const [helperThinking, setHelperThinking] = useState("");
+  const [helperPromptText, setHelperPromptText] = useState("");
   const [helperDebugMode, setHelperDebugMode] = useState(false);
   const [helperModel, setHelperModel] = useState("");
   const [helperSources, setHelperSources] = useState<WebSource[]>([]);
@@ -185,6 +194,7 @@ export default function DeadlinesPage() {
   const [copied, setCopied] = useState(false);
 
   const aiElapsed = useElapsedSeconds(helperLoading || waParsing);
+  const { upsertExternalTask } = useBackgroundAi();
 
   const loadData = useCallback(async () => {
     try {
@@ -364,37 +374,89 @@ export default function DeadlinesPage() {
       toast.error("Upload a WhatsApp .txt export or paste messages first");
       return;
     }
+    waAbortRef.current?.abort();
+    const ac = new AbortController();
+    waAbortRef.current = ac;
     setWaParsing(true);
+
+    const taskId = "whatsapp-extract";
+    upsertExternalTask(
+      {
+        id: taskId,
+        feature: "whatsapp_extract",
+        title: "WhatsApp Chat Extractor",
+        subtitle: `Parsing ${waFile ? waFile.name : "chat text"}...`,
+        status: "running",
+        actionLabel: "Review Items",
+        onOpenResult: () => setWaOpen(true),
+      },
+      () => ac.abort(),
+    );
+
     try {
       const fd = new FormData();
       if (waFile) fd.append("file", waFile);
       else fd.append("text", waText);
 
-      const res = await fetch("/api/ai/whatsapp", { method: "POST", body: fd });
+      const res = await fetch("/api/ai/whatsapp", {
+        method: "POST",
+        body: fd,
+        signal: ac.signal,
+      });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "WhatsApp parsing failed");
 
-      setWaDeadlines(
-        (json.deadlines || []).map((d: ExtractedDeadline) => ({
-          ...d,
-          selected: true,
-        })),
-      );
-      setWaEvents(
-        (json.events || []).map((e: ExtractedEvent) => ({
-          ...e,
-          selected: true,
-        })),
-      );
+      const dl = (json.deadlines || []).map((d: ExtractedDeadline) => ({
+        ...d,
+        selected: true,
+      }));
+      const ev = (json.events || []).map((e: ExtractedEvent) => ({
+        ...e,
+        selected: true,
+      }));
+      setWaDeadlines(dl);
+      setWaEvents(ev);
       setWaMaterials(json.materials || []);
+      upsertExternalTask({
+        id: taskId,
+        feature: "whatsapp_extract",
+        title: "WhatsApp Chat Extractor",
+        subtitle: `Found ${dl.length} deadlines, ${ev.length} events`,
+        status: "done",
+        actionLabel: "Review Items",
+        onOpenResult: () => setWaOpen(true),
+      });
       toast.success("WhatsApp chat analyzed!");
     } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : "Could not parse WhatsApp chat",
-      );
+      if (err instanceof Error && err.name === "AbortError") {
+        upsertExternalTask({
+          id: taskId,
+          feature: "whatsapp_extract",
+          title: "WhatsApp Chat Extractor",
+          subtitle: "Stopped by user",
+          status: "stopped",
+        });
+        toast.info("WhatsApp analysis stopped");
+      } else {
+        const msg =
+          err instanceof Error ? err.message : "Could not parse WhatsApp chat";
+        upsertExternalTask({
+          id: taskId,
+          feature: "whatsapp_extract",
+          title: "WhatsApp Chat Extractor",
+          subtitle: "Failed",
+          status: "error",
+          errorText: msg,
+        });
+        toast.error(msg);
+      }
     } finally {
       setWaParsing(false);
     }
+  }
+
+  function stopWhatsAppParse() {
+    waAbortRef.current?.abort();
   }
 
   async function importSelectedFromWhatsApp() {
@@ -474,6 +536,8 @@ export default function DeadlinesPage() {
     setSolverQuestions(item.questions || "");
     setSolverFile(null);
     setHelperAnswer(item.aiAnswer || "");
+    setHelperThinking("");
+    setHelperPromptText("");
 
     if (item.aiSources) {
       try {
@@ -490,28 +554,56 @@ export default function DeadlinesPage() {
     }
   }
 
+  function stopSolver() {
+    solverAbortRef.current?.abort();
+  }
+
   async function generateAnswer(modeOverride?: "answer" | "project_report" | "viva_prep") {
     if (!helperTarget) return;
+    const targetItem = helperTarget;
+    solverAbortRef.current?.abort();
+    const ac = new AbortController();
+    solverAbortRef.current = ac;
+
     const mode = modeOverride || helperMode;
     setHelperMode(mode);
     setHelperLoading(true);
     setHelperAnswer("");
     setHelperThinking("");
+    setHelperPromptText("");
     setHelperSources([]);
     setHelperNotes([]);
 
+    const taskId = `solver-${targetItem.id}`;
+    upsertExternalTask(
+      {
+        id: taskId,
+        feature: `deadline_solver_${mode}`,
+        title: "Assignment AI Solver",
+        subtitle: `Solving ${targetItem.title}...`,
+        status: "running",
+        actionLabel: "View Solution",
+        onOpenResult: () => {
+          setHelperTarget(targetItem);
+        },
+      },
+      () => ac.abort(),
+    );
+
     try {
       const fd = new FormData();
-      fd.append("deadlineId", helperTarget.id);
+      fd.append("deadlineId", targetItem.id);
       fd.append("mode", mode);
       fd.append("questions", solverQuestions);
       fd.append("useWebSearch", String(useWebSearch));
+      fd.append("think", String(helperThink));
       fd.append("stream", "true");
       if (solverFile) fd.append("file", solverFile);
 
       const res = await fetch("/api/ai/deadline-helper", {
         method: "POST",
         body: fd,
+        signal: ac.signal,
       });
 
       if (!res.ok) {
@@ -526,6 +618,7 @@ export default function DeadlinesPage() {
           savedQuestions?: string;
           debugMode?: boolean;
           model?: string;
+          promptPreview?: string;
         },
         {
           answer: string;
@@ -540,6 +633,7 @@ export default function DeadlinesPage() {
           if (meta.savedQuestions) setSolverQuestions(meta.savedQuestions);
           if (meta.debugMode !== undefined) setHelperDebugMode(meta.debugMode);
           if (meta.model) setHelperModel(meta.model);
+          if (meta.promptPreview) setHelperPromptText(meta.promptPreview);
         },
         onThinking: (txt) => {
           setHelperThinking((prev) => prev + txt);
@@ -548,46 +642,65 @@ export default function DeadlinesPage() {
           setHelperAnswer((prev) => prev + tok);
         },
         onDone: (json) => {
-          setHelperAnswer(json.answer || "");
+          const solvedText = json.answer || "";
+          setHelperAnswer(solvedText);
           setHelperSources(json.webSources || []);
           setHelperNotes(json.openedNotes || []);
           if (json.savedQuestions) {
             setSolverQuestions(json.savedQuestions);
           }
+          const updatedItem: DeadlineItem = {
+            ...targetItem,
+            questions: json.savedQuestions || targetItem.questions,
+            aiAnswer: solvedText || targetItem.aiAnswer,
+            aiAnswerMode: mode,
+            aiSources: JSON.stringify({
+              openedNotes: json.openedNotes || [],
+              webSources: json.webSources || [],
+            }),
+          };
           setDeadlines((prev) =>
-            prev.map((d) =>
-              d.id === helperTarget.id
-                ? {
-                    ...d,
-                    questions: json.savedQuestions || d.questions,
-                    aiAnswer: json.answer || d.aiAnswer,
-                    aiAnswerMode: mode,
-                    aiSources: JSON.stringify({
-                      openedNotes: json.openedNotes || [],
-                      webSources: json.webSources || [],
-                    }),
-                  }
-                : d,
-            ),
+            prev.map((d) => (d.id === targetItem.id ? updatedItem : d)),
           );
           setHelperTarget((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  questions: json.savedQuestions || prev.questions,
-                  aiAnswer: json.answer || prev.aiAnswer,
-                  aiAnswerMode: mode,
-                }
-              : null,
+            prev && prev.id === targetItem.id ? updatedItem : prev,
           );
+          upsertExternalTask({
+            id: taskId,
+            feature: `deadline_solver_${mode}`,
+            title: "Assignment AI Solver",
+            subtitle: `Solution ready for ${targetItem.title}`,
+            status: "done",
+            actionLabel: "View Solution",
+            onOpenResult: () => openSolver(updatedItem),
+          });
         },
       });
       setSolverFile(null);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not solve assignment");
-      setHelperAnswer(
-        `Error: ${err instanceof Error ? err.message : "Check AI Settings."}`,
-      );
+      if (err instanceof Error && err.name === "AbortError") {
+        upsertExternalTask({
+          id: taskId,
+          feature: `deadline_solver_${mode}`,
+          title: "Assignment AI Solver",
+          subtitle: "Stopped by user",
+          status: "stopped",
+        });
+        toast.info("Generation stopped");
+      } else {
+        const msg =
+          err instanceof Error ? err.message : "Could not solve assignment";
+        upsertExternalTask({
+          id: taskId,
+          feature: `deadline_solver_${mode}`,
+          title: "Assignment AI Solver",
+          subtitle: "Failed",
+          status: "error",
+          errorText: msg,
+        });
+        toast.error(msg);
+        setHelperAnswer(`Error: ${msg}`);
+      }
     } finally {
       setHelperLoading(false);
     }
@@ -606,7 +719,7 @@ export default function DeadlinesPage() {
       <motion.div
         initial={{ opacity: 0, y: 12 }}
         animate={{ opacity: 1, y: 0 }}
-        className="flex flex-col sm:flex-row sm:items-center justify-between gap-4"
+        className="flex flex-col sm:flex-row sm:items-end justify-between gap-4"
       >
         <div>
           <StudyHeroEmblem icon={Target} eyebrow="Submissions & Exams" accentColor="amber" />
@@ -615,10 +728,11 @@ export default function DeadlinesPage() {
           </h1>
           <p className="text-sm text-muted-foreground mt-1">
             Track exams & assignments, parse WhatsApp exports, and generate
-            submission-ready answers with web search
+            submission-ready answers grounded in your notes
           </p>
         </div>
         <div className="flex items-center gap-2.5 flex-wrap">
+          <AiLogsButton />
           <Button variant="outline" onClick={() => setWaOpen(true)}>
             <MessageSquareText className="h-4 w-4 text-emerald-400" />
             WhatsApp Import
@@ -630,198 +744,205 @@ export default function DeadlinesPage() {
         </div>
       </motion.div>
 
-      {/* Filter Bar */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <div className="flex items-center gap-2 flex-wrap">
-          {[
-            { id: "ALL", label: `All (${counts.all})` },
-            { id: "PENDING", label: `Pending (${counts.pending})` },
-            { id: "IN_PROGRESS", label: `In Progress (${counts.inProgress})` },
-            { id: "COMPLETED", label: `Completed (${counts.completed})` },
-            { id: "OVERDUE", label: `Overdue (${counts.overdue})` },
-          ].map((tab) => (
-            <button
-              key={tab.id}
-              onClick={() => setStatusFilter(tab.id)}
-              className={cn(
-                "px-3 py-1.5 rounded-lg text-xs font-medium border transition-all cursor-pointer",
-                statusFilter === tab.id
-                  ? "bg-primary/20 border-primary/50 text-primary"
-                  : "border-glass-border text-muted-foreground hover:text-foreground hover:bg-glass-hover",
-              )}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
-
-        <Select value={typeFilter} onValueChange={setTypeFilter}>
-          <SelectTrigger className="w-[180px]">
-            <SelectValue placeholder="All Types" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="ALL">All Categories</SelectItem>
-            {DEADLINE_TYPES.map((t) => (
-              <SelectItem key={t.value} value={t.value}>
-                {t.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-
-      {/* Deadline List */}
-      {loading ? (
-        <div className="space-y-3">
-          {Array.from({ length: 4 }).map((_, i) => (
-            <div key={i} className="h-24 rounded-xl shimmer" />
-          ))}
-        </div>
-      ) : filteredDeadlines.length === 0 ? (
-        <Card className="p-12 text-center space-y-3">
-          <Target className="h-10 w-10 text-muted-foreground mx-auto" />
-          <h3 className="text-lg font-semibold">No deadlines found</h3>
-          <p className="text-sm text-muted-foreground max-w-md mx-auto">
-            Add assignments or import your WhatsApp group chat export with AI.
-          </p>
-          <div className="flex items-center justify-center gap-2">
-            <Button variant="outline" onClick={() => setWaOpen(true)}>
-              <MessageSquareText className="h-4 w-4 text-emerald-400" /> Import
-              WhatsApp
-            </Button>
-            <Button onClick={openNew}>
-              <Plus className="h-4 w-4" /> Create Deadline
-            </Button>
-          </div>
-        </Card>
-      ) : (
-        <div className="space-y-3">
-          {filteredDeadlines.map((d) => {
-            const isOverdue =
-              d.status !== "COMPLETED" && new Date(d.dueAt) < new Date();
-            return (
-              <Card
-                key={d.id}
+      {/* Unified Deadlines Studio Frame (matches /chat box & curve) */}
+      <div className="studio-shell">
+        {/* Integrated Filter Strip */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-glass-border/60 bg-muted/25 p-3.5 sm:px-5">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {[
+              { id: "ALL", label: `All (${counts.all})` },
+              { id: "PENDING", label: `Pending (${counts.pending})` },
+              { id: "IN_PROGRESS", label: `In Progress (${counts.inProgress})` },
+              { id: "COMPLETED", label: `Completed (${counts.completed})` },
+              { id: "OVERDUE", label: `Overdue (${counts.overdue})` },
+            ].map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => setStatusFilter(tab.id)}
                 className={cn(
-                  "p-4 transition-all",
-                  d.status === "COMPLETED" && "opacity-65",
+                  "px-3 py-1.5 rounded-lg text-xs font-medium border transition-all cursor-pointer",
+                  statusFilter === tab.id
+                    ? "bg-primary/20 border-primary/50 text-primary"
+                    : "border-transparent text-muted-foreground hover:text-foreground hover:bg-glass-hover",
                 )}
               >
-                <CardContent className="p-0 flex flex-col md:flex-row md:items-center justify-between gap-4">
-                  <div className="flex items-start gap-3.5 min-w-0">
-                    <button
-                      onClick={() => cycleStatus(d)}
-                      className="mt-0.5 text-muted-foreground hover:text-primary transition-colors cursor-pointer shrink-0"
-                      title="Click to cycle status"
-                    >
-                      {d.status === "COMPLETED" ? (
-                        <CheckCircle2 className="h-5 w-5 text-emerald-400" />
-                      ) : d.status === "IN_PROGRESS" ? (
-                        <Clock className="h-5 w-5 text-amber-400" />
-                      ) : (
-                        <Circle className="h-5 w-5" />
-                      )}
-                    </button>
+                {tab.label}
+              </button>
+            ))}
+          </div>
 
-                    <div className="min-w-0 space-y-1">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <h3
-                          className={cn(
-                            "font-semibold text-foreground",
-                            d.status === "COMPLETED" && "line-through",
-                          )}
-                        >
-                          {d.title}
-                        </h3>
-                        <Badge variant="outline">
-                          {DEADLINE_TYPES.find((t) => t.value === d.deadlineType)
-                            ?.label || d.deadlineType}
-                        </Badge>
-                        {d.subject && (
-                          <Badge
-                            variant="outline"
-                            style={{
-                              borderColor: `${d.subject.color}60`,
-                              color: d.subject.color,
-                            }}
-                          >
-                            {d.subject.code || d.subject.name}
-                          </Badge>
-                        )}
-                        {d.questions && (
-                          <Badge variant="secondary" className="text-[10px]">
-                            Questions Saved
-                          </Badge>
-                        )}
-                        {d.aiAnswer && (
-                          <Badge variant="success" className="text-[10px]">
-                            Solution Saved
-                          </Badge>
-                        )}
-                      </div>
-                      {d.description && (
-                        <p className="text-xs text-muted-foreground whitespace-pre-line">
-                          {d.description}
-                        </p>
-                      )}
-                      <p className="text-xs text-muted-foreground">
-                        Due: {formatDateTime(d.dueAt)}
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
-                    {isOverdue && (
-                      <Badge variant="destructive" className="gap-1">
-                        <AlertTriangle className="h-3 w-3" /> Overdue
-                      </Badge>
-                    )}
-                    <Badge className={getPriorityColor(d.priority)}>
-                      {d.priority}
-                    </Badge>
-                    <span
-                      className={cn(
-                        "text-xs font-medium min-w-[70px] text-right",
-                        d.status === "COMPLETED"
-                          ? "text-emerald-400"
-                          : getDeadlineColor(d.dueAt),
-                      )}
-                    >
-                      {d.status === "COMPLETED"
-                        ? "Done"
-                        : formatRelativeTime(d.dueAt)}
-                    </span>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-8 text-xs text-accent border-primary/40"
-                      onClick={() => openSolver(d)}
-                    >
-                      <Sparkles className="h-3.5 w-3.5 text-primary" /> AI Solve
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-8 w-8"
-                      onClick={() => openEdit(d)}
-                    >
-                      <Edit2 className="h-3.5 w-3.5" />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-8 w-8 text-destructive hover:text-destructive"
-                      onClick={() => handleDelete(d.id)}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </Button>
-                  </div>
-                </CardContent>
-              </Card>
-            );
-          })}
+          <Select value={typeFilter} onValueChange={setTypeFilter}>
+            <SelectTrigger className="w-full sm:w-[190px] h-9">
+              <SelectValue placeholder="All Categories" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="ALL">All Categories</SelectItem>
+              {DEADLINE_TYPES.map((t) => (
+                <SelectItem key={t.value} value={t.value}>
+                  {t.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
-      )}
+
+        {/* Deadline List Body */}
+        <div className="p-4 sm:p-5">
+          {loading ? (
+            <div className="space-y-3">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <div key={i} className="h-24 rounded-xl shimmer" />
+              ))}
+            </div>
+          ) : filteredDeadlines.length === 0 ? (
+            <div className="py-12 px-6 text-center space-y-3">
+              <div className="h-12 w-12 rounded-2xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center mx-auto">
+                <Target className="h-6 w-6 text-amber-400" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-lg font-semibold">No deadlines found</h3>
+                <p className="text-sm text-muted-foreground max-w-md mx-auto">
+                  Use <span className="text-foreground font-medium">WhatsApp Import</span> or{" "}
+                  <span className="text-foreground font-medium">New Deadline</span> in the top bar to track upcoming submissions, lab exams, and quizzes.
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {filteredDeadlines.map((d) => {
+                const isOverdue =
+                  d.status !== "COMPLETED" && new Date(d.dueAt) < new Date();
+                return (
+                  <Card
+                    key={d.id}
+                    className={cn(
+                      "p-4 sm:p-5 transition-all hover:border-primary/35",
+                      d.status === "COMPLETED" && "opacity-65",
+                    )}
+                  >
+                    <CardContent className="p-0 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                      <div className="flex items-start gap-3.5 min-w-0 flex-1">
+                        <button
+                          onClick={() => cycleStatus(d)}
+                          className="mt-0.5 text-muted-foreground hover:text-primary transition-colors cursor-pointer shrink-0"
+                          title="Click to cycle status"
+                        >
+                          {d.status === "COMPLETED" ? (
+                            <CheckCircle2 className="h-5 w-5 text-emerald-400" />
+                          ) : d.status === "IN_PROGRESS" ? (
+                            <Clock className="h-5 w-5 text-amber-400" />
+                          ) : (
+                            <Circle className="h-5 w-5" />
+                          )}
+                        </button>
+
+                        <div className="min-w-0 flex-1 space-y-1.5">
+                          <h3
+                            className={cn(
+                              "font-semibold text-base text-foreground leading-snug",
+                              d.status === "COMPLETED" && "line-through",
+                            )}
+                          >
+                            {d.title}
+                          </h3>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <Badge variant="outline" className="text-[11px]">
+                              {DEADLINE_TYPES.find((t) => t.value === d.deadlineType)
+                                ?.label || d.deadlineType}
+                            </Badge>
+                            {d.subject && (
+                              <Badge
+                                variant="outline"
+                                className="text-[11px]"
+                                style={{
+                                  borderColor: `${d.subject.color}60`,
+                                  color: d.subject.color,
+                                }}
+                              >
+                                {d.subject.code || d.subject.name}
+                              </Badge>
+                            )}
+                            {d.questions && (
+                              <Badge variant="secondary" className="text-[10px]">
+                                Questions Saved
+                              </Badge>
+                            )}
+                            {d.aiAnswer && (
+                              <Badge variant="success" className="text-[10px]">
+                                Solution Saved
+                              </Badge>
+                            )}
+                          </div>
+                          {d.description && (
+                            <p className="text-xs text-muted-foreground whitespace-pre-line line-clamp-2">
+                              {d.description}
+                            </p>
+                          )}
+                          <p className="text-xs text-muted-foreground">
+                            Due: {formatDateTime(d.dueAt)}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between lg:justify-end gap-2.5 shrink-0 pt-2 lg:pt-0 border-t lg:border-t-0 border-glass-border/50">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          {isOverdue && (
+                            <Badge variant="destructive" className="gap-1">
+                              <AlertTriangle className="h-3 w-3" /> Overdue
+                            </Badge>
+                          )}
+                          <Badge className={getPriorityColor(d.priority)}>
+                            {d.priority}
+                          </Badge>
+                          <span
+                            className={cn(
+                              "text-xs font-medium min-w-[68px] text-left lg:text-right",
+                              d.status === "COMPLETED"
+                                ? "text-emerald-400"
+                                : getDeadlineColor(d.dueAt),
+                            )}
+                          >
+                            {d.status === "COMPLETED"
+                              ? "Done"
+                              : formatRelativeTime(d.dueAt)}
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-1.5">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-8 text-xs text-accent border-primary/40 hover:bg-primary/15"
+                            onClick={() => openSolver(d)}
+                          >
+                            <Sparkles className="h-3.5 w-3.5 text-primary" /> AI Solve
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8"
+                            onClick={() => openEdit(d)}
+                          >
+                            <Edit2 className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8 text-destructive hover:text-destructive"
+                            onClick={() => handleDelete(d.id)}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
 
       {/* Create/Edit Deadline Dialog */}
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
@@ -847,7 +968,7 @@ export default function DeadlinesPage() {
               />
             </div>
 
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label>Category</Label>
                 <Select
@@ -890,7 +1011,7 @@ export default function DeadlinesPage() {
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label htmlFor="dl-date">Due Date</Label>
                 <Input
@@ -913,7 +1034,7 @@ export default function DeadlinesPage() {
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label>Subject (Optional)</Label>
                 <Select value={subjectId} onValueChange={setSubjectId}>
@@ -993,7 +1114,7 @@ export default function DeadlinesPage() {
         </DialogContent>
       </Dialog>
 
-      {/* WhatsApp Chat Extractor Modal */}
+      {/* WhatsApp Chat Extractor Modal (closing leaves active background task alive) */}
       <Dialog open={waOpen} onOpenChange={setWaOpen}>
         <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>
@@ -1003,21 +1124,38 @@ export default function DeadlinesPage() {
             </DialogTitle>
             <DialogDescription>
               Upload your exported WhatsApp <code>.txt</code> chat or paste
-              messages. Uses your fast model to extract assignments, exams,
-              events, and shared PDFs.
+              messages to extract assignments, exams, calendar events, and shared
+              notes.
             </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-4">
-            <div className="flex items-center gap-3 flex-wrap">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => waFileRef.current?.click()}
-              >
-                <Upload className="h-4 w-4" />
-                {waFile ? waFile.name : "Choose WhatsApp .txt Export"}
-              </Button>
+            <div className="flex items-center justify-between gap-3 rounded-xl border border-glass-border bg-muted/25 p-3 flex-wrap">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => waFileRef.current?.click()}
+                  disabled={waParsing}
+                >
+                  <Upload className="h-4 w-4" />
+                  {waFile ? "Change .txt File" : "Choose WhatsApp .txt Export"}
+                </Button>
+                {waFile && (
+                  <span className="inline-flex items-center gap-1.5 rounded-md border border-primary/30 bg-primary/10 px-2.5 py-1 text-xs text-accent max-w-[240px] truncate">
+                    <span className="truncate">{waFile.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => setWaFile(null)}
+                      className="text-muted-foreground hover:text-foreground cursor-pointer"
+                      aria-label="Clear file"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </span>
+                )}
+              </div>
               <input
                 ref={waFileRef}
                 type="file"
@@ -1028,107 +1166,177 @@ export default function DeadlinesPage() {
                   setWaFile(f);
                 }}
               />
-              {waFile && (
-                <button
-                  onClick={() => setWaFile(null)}
-                  className="text-xs text-muted-foreground hover:text-foreground cursor-pointer"
-                >
-                  Clear file
-                </button>
-              )}
+              <span className="text-[11px] text-muted-foreground">
+                Media & deleted messages auto-filtered
+              </span>
             </div>
 
             {!waFile && (
-              <div className="space-y-1.5">
+              <div className="space-y-2">
                 <Label>Or paste WhatsApp messages directly</Label>
                 <Textarea
                   rows={5}
                   placeholder="Paste exported group chat messages here..."
                   value={waText}
                   onChange={(e) => setWaText(e.target.value)}
+                  disabled={waParsing}
                 />
               </div>
             )}
 
-            <Button
-              type="button"
-              variant="glow"
-              onClick={parseWhatsApp}
-              disabled={waParsing}
-            >
-              {waParsing ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" /> Analyzing Chat (
-                  {aiElapsed}s)
-                </>
-              ) : (
-                <>
-                  <Sparkles className="h-4 w-4" /> Extract Academic Items
-                </>
+            <div className="flex items-center gap-2.5">
+              <Button
+                type="button"
+                variant="glow"
+                onClick={parseWhatsApp}
+                disabled={waParsing}
+              >
+                {waParsing ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" /> Analyzing Chat (
+                    {aiElapsed}s)
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="h-4 w-4" /> Extract Academic Items
+                  </>
+                )}
+              </Button>
+              {waParsing && (
+                <Button
+                  type="button"
+                  variant="destructive"
+                  size="sm"
+                  onClick={stopWhatsAppParse}
+                >
+                  <Square className="h-3.5 w-3.5" /> Stop
+                </Button>
               )}
-            </Button>
+            </div>
 
             {(waDeadlines.length > 0 ||
               waEvents.length > 0 ||
               waMaterials.length > 0) && (
-              <div className="space-y-4 pt-3 border-t border-glass-border">
+              <div className="space-y-4 pt-4 border-t border-glass-border">
                 {waDeadlines.length > 0 && (
-                  <div className="space-y-2">
-                    <h4 className="text-sm font-semibold text-foreground">
-                      Deadlines Found ({waDeadlines.length})
-                    </h4>
-                    {waDeadlines.map((d, i) => (
-                      <label
-                        key={i}
-                        className="flex items-start gap-2.5 rounded-lg border border-glass-border bg-muted/40 p-3 cursor-pointer"
+                  <div className="space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <h4 className="text-sm font-semibold text-foreground">
+                        Deadlines Found ({waDeadlines.filter((d) => d.selected).length}/{waDeadlines.length})
+                      </h4>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const allSelected = waDeadlines.every((d) => d.selected);
+                          setWaDeadlines((prev) =>
+                            prev.map((d) => ({ ...d, selected: !allSelected })),
+                          );
+                        }}
+                        className="text-xs text-primary hover:underline cursor-pointer"
                       >
-                        <input
-                          type="checkbox"
-                          checked={d.selected}
-                          onChange={(e) =>
-                            setWaDeadlines((prev) =>
-                              prev.map((item, idx) =>
-                                idx === i
-                                  ? { ...item, selected: e.target.checked }
-                                  : item,
-                              ),
-                            )
-                          }
-                          className="mt-1 accent-primary"
-                        />
-                        <div className="text-xs space-y-1">
-                          <p className="font-semibold text-sm text-foreground">
-                            {d.title}
-                          </p>
-                          <p className="text-muted-foreground">
-                            {d.deadlineType} • Due {d.dueAt} • Priority:{" "}
-                            {d.priority}
-                          </p>
-                          {d.writeupHint && (
-                            <p className="text-accent">
-                              What to write: {d.writeupHint}
+                        {waDeadlines.every((d) => d.selected)
+                          ? "Deselect all"
+                          : "Select all"}
+                      </button>
+                    </div>
+                    {waDeadlines.map((d, i) => (
+                      <div
+                        key={i}
+                        className="flex flex-col sm:flex-row sm:items-start justify-between gap-3 rounded-xl border border-glass-border bg-muted/35 p-3.5"
+                      >
+                        <label className="flex items-start gap-2.5 cursor-pointer flex-1 min-w-0">
+                          <input
+                            type="checkbox"
+                            checked={Boolean(d.selected)}
+                            onChange={(e) =>
+                              setWaDeadlines((prev) =>
+                                prev.map((item, idx) =>
+                                  idx === i
+                                    ? { ...item, selected: e.target.checked }
+                                    : item,
+                                ),
+                              )
+                            }
+                            className="mt-1 accent-primary shrink-0"
+                          />
+                          <div className="text-xs space-y-1 min-w-0">
+                            <p className="font-semibold text-sm text-foreground">
+                              {d.title}
                             </p>
-                          )}
-                        </div>
-                      </label>
+                            <p className="text-muted-foreground">
+                              {d.deadlineType} • Due {formatDateTime(d.dueAt)} •{" "}
+                              {d.priority}
+                            </p>
+                            {d.writeupHint && (
+                              <p className="text-accent">
+                                What to write: {d.writeupHint}
+                              </p>
+                            )}
+                          </div>
+                        </label>
+                        {subjects.length > 0 && (
+                          <div className="sm:w-44 shrink-0">
+                            <Select
+                              value={d.subjectId || "NONE"}
+                              onValueChange={(v) =>
+                                setWaDeadlines((prev) =>
+                                  prev.map((item, idx) =>
+                                    idx === i
+                                      ? { ...item, subjectId: v === "NONE" ? null : v }
+                                      : item,
+                                  ),
+                                )
+                              }
+                            >
+                              <SelectTrigger className="h-8 text-xs">
+                                <SelectValue placeholder="Subject" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="NONE">No Subject</SelectItem>
+                                {subjects.map((s) => (
+                                  <SelectItem key={s.id} value={s.id}>
+                                    {s.code || s.name}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        )}
+                      </div>
                     ))}
                   </div>
                 )}
 
                 {waEvents.length > 0 && (
-                  <div className="space-y-2">
-                    <h4 className="text-sm font-semibold text-foreground flex items-center gap-1.5">
-                      <CalendarPlus className="h-4 w-4 text-primary" />
-                      Calendar Events Found ({waEvents.length})
-                    </h4>
+                  <div className="space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <h4 className="text-sm font-semibold text-foreground flex items-center gap-1.5">
+                        <CalendarPlus className="h-4 w-4 text-primary" />
+                        Calendar Events Found ({waEvents.filter((e) => e.selected).length}/{waEvents.length})
+                      </h4>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const allSelected = waEvents.every((e) => e.selected);
+                          setWaEvents((prev) =>
+                            prev.map((e) => ({ ...e, selected: !allSelected })),
+                          );
+                        }}
+                        className="text-xs text-primary hover:underline cursor-pointer"
+                      >
+                        {waEvents.every((e) => e.selected)
+                          ? "Deselect all"
+                          : "Select all"}
+                      </button>
+                    </div>
                     {waEvents.map((ev, i) => (
                       <label
                         key={i}
-                        className="flex items-start gap-2.5 rounded-lg border border-glass-border bg-muted/40 p-3 cursor-pointer"
+                        className="flex items-start gap-2.5 rounded-xl border border-glass-border bg-muted/35 p-3.5 cursor-pointer"
                       >
                         <input
                           type="checkbox"
-                          checked={ev.selected}
+                          checked={Boolean(ev.selected)}
                           onChange={(e) =>
                             setWaEvents((prev) =>
                               prev.map((item, idx) =>
@@ -1138,14 +1346,14 @@ export default function DeadlinesPage() {
                               ),
                             )
                           }
-                          className="mt-1 accent-primary"
+                          className="mt-1 accent-primary shrink-0"
                         />
-                        <div className="text-xs space-y-0.5">
+                        <div className="text-xs space-y-0.5 min-w-0">
                           <p className="font-semibold text-sm text-foreground">
                             {ev.title}
                           </p>
                           <p className="text-muted-foreground">
-                            {ev.eventType} • {ev.startAt}
+                            {ev.eventType} • {formatDateTime(ev.startAt)}
                             {ev.location ? ` @ ${ev.location}` : ""}
                           </p>
                         </div>
@@ -1164,7 +1372,7 @@ export default function DeadlinesPage() {
                       {waMaterials.map((m, i) => (
                         <div
                           key={i}
-                          className="rounded-lg border border-glass-border/60 bg-muted/30 p-2.5 text-xs"
+                          className="rounded-xl border border-glass-border/60 bg-muted/30 p-3 text-xs"
                         >
                           <span className="font-medium text-foreground">
                             {m.name}
@@ -1183,26 +1391,32 @@ export default function DeadlinesPage() {
                   </div>
                 )}
 
-                <Button
-                  type="button"
-                  variant="glow"
-                  onClick={importSelectedFromWhatsApp}
-                  disabled={waImporting}
-                >
-                  {waImporting
-                    ? "Importing..."
-                    : "Import Selected Deadlines & Events"}
-                </Button>
+                <DialogFooter className="pt-2">
+                  <Button
+                    type="button"
+                    variant="glow"
+                    onClick={importSelectedFromWhatsApp}
+                    disabled={waImporting}
+                  >
+                    {waImporting
+                      ? "Importing..."
+                      : "Import Selected Deadlines & Events"}
+                  </Button>
+                </DialogFooter>
               </div>
             )}
           </div>
         </DialogContent>
       </Dialog>
 
-      {/* AI Assignment & Project Answer Solver Modal */}
+      {/* AI Assignment & Project Answer Solver Modal (closing leaves active solver running in Background AI Dock) */}
       <Dialog
         open={Boolean(helperTarget)}
-        onOpenChange={(open) => !open && setHelperTarget(null)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setHelperTarget(null);
+          }
+        }}
       >
         <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>
@@ -1216,12 +1430,13 @@ export default function DeadlinesPage() {
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-3">
-            <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div className="space-y-4">
+            {/* Mode Selector + AI Toggles */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
               <div className="flex items-center gap-1.5 flex-wrap">
                 {(
                   [
-                    { id: "answer", label: "Full Assignment Answer" },
+                    { id: "answer", label: "Assignment Answer" },
                     { id: "project_report", label: "Project / Lab Report" },
                     { id: "viva_prep", label: "Exam / Viva Q&A" },
                   ] as const
@@ -1238,38 +1453,69 @@ export default function DeadlinesPage() {
                 ))}
               </div>
 
-              <button
-                type="button"
-                onClick={() => setUseWebSearch(!useWebSearch)}
-                className={cn(
-                  "px-3 py-1.5 rounded-lg text-xs font-medium border inline-flex items-center gap-1.5 cursor-pointer transition-colors",
-                  useWebSearch
-                    ? "bg-primary/20 border-primary text-primary"
-                    : "border-glass-border text-muted-foreground hover:text-foreground",
-                )}
-              >
-                <Globe className="h-3.5 w-3.5" />
-                Web Search {useWebSearch ? "On" : "Off"}
-              </button>
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => setUseWebSearch(!useWebSearch)}
+                  disabled={helperLoading}
+                  className={cn(
+                    "px-3 py-1.5 rounded-lg text-xs font-medium border inline-flex items-center gap-1.5 cursor-pointer transition-colors",
+                    useWebSearch
+                      ? "bg-primary/20 border-primary text-primary"
+                      : "border-glass-border text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <Globe className="h-3.5 w-3.5" />
+                  Web Search {useWebSearch ? "On" : "Off"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setHelperThink(!helperThink)}
+                  disabled={helperLoading}
+                  className={cn(
+                    "px-3 py-1.5 rounded-lg text-xs font-medium border inline-flex items-center gap-1.5 cursor-pointer transition-colors",
+                    helperThink
+                      ? "bg-primary/20 border-primary text-primary"
+                      : "border-glass-border text-muted-foreground hover:text-foreground",
+                  )}
+                  title="Toggle reasoning before final solution"
+                >
+                  <Brain className="h-3.5 w-3.5" />
+                  Think {helperThink ? "On" : "Off"}
+                </button>
+              </div>
             </div>
 
-            <div className="space-y-2 rounded-xl border border-glass-border bg-muted/30 p-3">
+            {/* Prompt / Question Input Card */}
+            <div className="space-y-3 rounded-xl border border-glass-border bg-muted/25 p-4">
               <div className="flex items-center justify-between gap-2 flex-wrap">
-                <Label className="text-xs">
+                <Label className="text-xs font-medium">
                   Assignment Questions / Problem Statement
                 </Label>
                 <div className="flex items-center gap-2">
+                  {solverFile && (
+                    <span className="inline-flex items-center gap-1 rounded-md border border-primary/30 bg-primary/10 px-2 py-0.5 text-[11px] text-accent max-w-[180px]">
+                      <span className="truncate">{solverFile.name}</span>
+                      <button
+                        type="button"
+                        onClick={() => setSolverFile(null)}
+                        className="hover:text-foreground cursor-pointer"
+                        aria-label="Remove uploaded file"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </span>
+                  )}
                   <Button
                     type="button"
                     size="sm"
                     variant="outline"
-                    className="h-7 text-xs"
+                    className="h-8 text-xs"
                     onClick={() => assignFileRef.current?.click()}
+                    disabled={helperLoading}
                   >
-                    <Upload className="h-3 w-3" />
-                    {solverFile
-                      ? solverFile.name
-                      : "Upload Question Sheet (PDF/DOCX/TXT)"}
+                    <Upload className="h-3.5 w-3.5" />
+                    {solverFile ? "Replace Sheet" : "Upload Question Sheet"}
                   </Button>
                   <input
                     ref={assignFileRef}
@@ -1282,53 +1528,69 @@ export default function DeadlinesPage() {
                   />
                 </div>
               </div>
+
               <Textarea
                 rows={4}
                 placeholder="Paste your exact assignment questions, numericals, or group project rubric here..."
                 value={solverQuestions}
                 onChange={(e) => setSolverQuestions(e.target.value)}
+                disabled={helperLoading}
               />
-              <div className="flex items-center justify-between">
+
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-1">
                 <span className="text-[11px] text-muted-foreground">
-                  Automatically references your subject notes & web sources.
+                  Grounded in your uploaded subject notes
+                  {useWebSearch ? " & verified web search" : ""}.
                 </span>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="glow"
-                  onClick={() => generateAnswer()}
-                  disabled={helperLoading}
-                >
-                  {helperLoading ? (
-                    <>
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      Generating ({aiElapsed}s)
-                    </>
-                  ) : helperAnswer ? (
-                    <>
-                      <Sparkles className="h-3.5 w-3.5" /> Regenerate Answer
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="h-3.5 w-3.5" /> Generate Detailed
-                      Answer
-                    </>
+                <div className="flex items-center gap-2 justify-end">
+                  {helperLoading && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="destructive"
+                      onClick={stopSolver}
+                    >
+                      <Square className="h-3.5 w-3.5" /> Stop
+                    </Button>
                   )}
-                </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="glow"
+                    onClick={() => generateAnswer()}
+                    disabled={helperLoading}
+                  >
+                    {helperLoading ? (
+                      <>
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        Generating ({aiElapsed}s)
+                      </>
+                    ) : helperAnswer ? (
+                      <>
+                        <Sparkles className="h-3.5 w-3.5" /> Regenerate Solution
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="h-3.5 w-3.5" /> Generate Detailed
+                        Solution
+                      </>
+                    )}
+                  </Button>
+                </div>
               </div>
             </div>
 
             {(helperLoading || helperAnswer) && (
-              <div className="rounded-xl border border-glass-border bg-muted/40 p-4 space-y-3">
-                <div className="flex items-center justify-between">
+              <div className="rounded-xl border border-glass-border bg-muted/35 p-4 sm:p-5 space-y-3.5">
+                <div className="flex items-center justify-between gap-2">
                   <span className="text-xs font-semibold uppercase tracking-wider text-accent">
                     Generated Solution
                   </span>
                   {helperAnswer && !helperLoading && (
                     <Button
                       size="sm"
-                      variant="ghost"
-                      className="h-7 text-xs"
+                      variant="outline"
+                      className="h-8 text-xs"
                       onClick={copyAnswer}
                     >
                       {copied ? (
@@ -1346,11 +1608,12 @@ export default function DeadlinesPage() {
                   loading={helperLoading && !helperAnswer}
                   elapsedSeconds={aiElapsed}
                   thinkingText={helperThinking}
+                  promptText={helperPromptText}
                   model={helperModel}
                 />
 
                 {helperLoading && !helperAnswer ? (
-                  <div className="flex flex-col items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
+                  <div className="flex flex-col items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
                     <Loader2 className="h-6 w-6 animate-spin text-primary" />
                     <span>
                       Searching notes{useWebSearch ? " & web" : ""} and writing
@@ -1361,14 +1624,14 @@ export default function DeadlinesPage() {
                     </span>
                   </div>
                 ) : (
-                  <div className="max-h-[380px] overflow-y-auto pr-1">
+                  <div className="max-h-[400px] overflow-y-auto pr-1">
                     <MarkdownRenderer content={helperAnswer} />
                   </div>
                 )}
 
                 {(helperNotes.length > 0 || helperSources.length > 0) &&
                   !helperLoading && (
-                    <div className="pt-2 border-t border-glass-border/50 flex flex-wrap gap-1.5">
+                    <div className="pt-3 border-t border-glass-border/50 flex flex-wrap gap-1.5">
                       {helperNotes.map((n, i) => (
                         <Badge key={i} variant="outline" className="text-[10px]">
                           Note: {n.title}

@@ -30,6 +30,8 @@ export async function POST(request: NextRequest) {
 
     const { content: aiRaw } = await callAiChat({
       userId: user.id,
+      logFeature: "scratchpad_optimize",
+      signal: request.signal,
       ...aiRequest,
     });
 

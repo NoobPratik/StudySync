@@ -8,6 +8,7 @@ interface AiDebugPanelProps {
   loading: boolean;
   elapsedSeconds: number;
   thinkingText: string;
+  promptText?: string;
   outputText?: string;
   errorText?: string | null;
   model?: string;
@@ -20,6 +21,7 @@ export function AiDebugPanel({
   loading,
   elapsedSeconds,
   thinkingText,
+  promptText,
   outputText,
   errorText,
   model,
@@ -27,9 +29,12 @@ export function AiDebugPanel({
   defaultOpen = true,
 }: AiDebugPanelProps) {
   const [open, setOpen] = useState(defaultOpen);
+  const [showPrompt, setShowPrompt] = useState(false);
 
   if (!active) return null;
-  if (!loading && !thinkingText && !outputText && !errorText) return null;
+  if (!loading && !thinkingText && !outputText && !errorText && !promptText) {
+    return null;
+  }
 
   return (
     <div className="rounded-xl border border-primary/35 bg-black/45 p-3 space-y-2 text-xs">
@@ -47,7 +52,7 @@ export function AiDebugPanel({
           <Terminal className="h-3.5 w-3.5 text-primary shrink-0" />
           {loading && <Loader2 className="h-3 w-3 animate-spin shrink-0" />}
           <span className="truncate">
-            AI Debug Thinking{model ? ` • ${model}` : ""}
+            AI Debug Trace{model ? ` • ${model}` : ""}
             {extraLabel ? ` (${extraLabel})` : ""}
           </span>
         </div>
@@ -61,6 +66,28 @@ export function AiDebugPanel({
           {errorText && (
             <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive">
               {errorText}
+            </div>
+          )}
+
+          {promptText && (
+            <div className="space-y-1">
+              <button
+                type="button"
+                onClick={() => setShowPrompt((v) => !v)}
+                className="text-[10px] uppercase tracking-wider text-accent hover:text-primary inline-flex items-center gap-1 cursor-pointer"
+              >
+                {showPrompt ? (
+                  <ChevronDown className="h-3 w-3" />
+                ) : (
+                  <ChevronRight className="h-3 w-3" />
+                )}
+                Input Prompt Sent ({promptText.length} chars)
+              </button>
+              {showPrompt && (
+                <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] font-mono text-muted-foreground bg-muted/30 rounded-lg p-2.5 border border-glass-border/40">
+                  {promptText}
+                </pre>
+              )}
             </div>
           )}
 

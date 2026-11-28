@@ -2,7 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { getApiUser } from "@/lib/session";
-import { callAiChat, extractJsonFromAi } from "@/lib/ai";
+import {
+  buildCourseStudyContext,
+  callAiChat,
+  ensureNoteText,
+  extractJsonFromAi,
+} from "@/lib/ai";
 import { AI_PROMPTS } from "@/lib/ai-prompts";
 
 export async function GET() {
@@ -25,6 +30,7 @@ export async function GET() {
 
 const generateMockSchema = z.object({
   subjectId: z.string().min(1, "Please select a subject"),
+  moduleId: z.string().optional().nullable(),
   samplePaperId: z.string().optional().nullable(),
   noteIds: z.array(z.string()).optional(),
   totalMarks: z.number().int().min(10).max(200).default(50),
@@ -50,6 +56,7 @@ export async function POST(request: NextRequest) {
 
     const {
       subjectId,
+      moduleId,
       samplePaperId,
       noteIds,
       totalMarks,
@@ -71,7 +78,18 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Subject not found" }, { status: 404 });
     }
 
-    const [samplePaper, notes] = await Promise.all([
+    const selectedModule = moduleId
+      ? subject.modules.find((m) => m.id === moduleId) || null
+      : null;
+
+    if (moduleId && !selectedModule) {
+      return NextResponse.json(
+        { error: "Selected module not found" },
+        { status: 404 },
+      );
+    }
+
+    const [samplePaper, notes, courseCtx] = await Promise.all([
       samplePaperId
         ? prisma.samplePaper.findFirst({
             where: { id: samplePaperId, userId: user.id },
@@ -83,23 +101,55 @@ export async function POST(request: NextRequest) {
           subjectId: subject.id,
           ...(noteIds && noteIds.length > 0 ? { id: { in: noteIds } } : {}),
         },
-        select: { id: true, title: true, extractedText: true },
+        select: {
+          id: true,
+          title: true,
+          fileName: true,
+          fileType: true,
+          filePath: true,
+          extractedText: true,
+        },
         orderBy: { uploadedAt: "desc" },
         take: 4,
       }),
+      selectedModule && (!noteIds || noteIds.length === 0)
+        ? buildCourseStudyContext({
+            userId: user.id,
+            query: `${selectedModule.name} ${focusInstructions || ""}`,
+            subjectId: subject.id,
+            moduleId: selectedModule.id,
+            maxMaterialChars: 6000,
+          })
+        : Promise.resolve(null),
     ]);
 
-    const syllabusSummary = subject.modules
+    const scopedModules = selectedModule ? [selectedModule] : subject.modules;
+    const syllabusSummary = scopedModules
       .map(
         (m) =>
           `${m.name}: ${m.topics.map((t) => t.name).join(", ") || "No topics"}`,
       )
       .join("\n");
 
-    const notesSummary = notes
-      .filter((n) => n.extractedText)
-      .map((n) => `[Note: ${n.title}]\n${n.extractedText!.slice(0, 2200)}`)
-      .join("\n\n");
+    let notesSummary = courseCtx?.materialExcerpts || "";
+    if (!notesSummary) {
+      const hydratedNotes = await Promise.all(
+        notes.map(async (n) => {
+          const text = await ensureNoteText(n);
+          return { ...n, text };
+        }),
+      );
+      const validNotes = hydratedNotes.filter(
+        (n): n is typeof n & { text: string } => Boolean(n.text?.trim()),
+      );
+      const perNoteBudget = Math.max(
+        1600,
+        Math.floor(6000 / Math.max(1, validNotes.length)),
+      );
+      notesSummary = validNotes
+        .map((n) => `[Note: ${n.title}]\n${n.text.slice(0, perNoteBudget)}`)
+        .join("\n\n");
+    }
 
     if (!syllabusSummary && !notesSummary && !samplePaper) {
       return NextResponse.json(
@@ -113,6 +163,7 @@ export async function POST(request: NextRequest) {
 
     const aiRequest = AI_PROMPTS.generateMockExam({
       subjectName: subject.name,
+      selectedModuleName: selectedModule?.name,
       totalMarks,
       durationMinutes,
       focusInstructions,
@@ -124,6 +175,8 @@ export async function POST(request: NextRequest) {
 
     const { content, model } = await callAiChat({
       userId: user.id,
+      logFeature: "mock_exam_generate",
+      signal: request.signal,
       ...aiRequest,
     });
 

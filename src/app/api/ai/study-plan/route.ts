@@ -35,18 +35,22 @@ export async function POST(request: NextRequest) {
             sendEvent("meta", { debugMode: cfg.debugMode, model: cfg.model });
             const { content, model } = await callAiChatStream({
               userId: user.id,
+              logFeature: "study_plan",
+              signal: request.signal,
               ...aiRequest,
               onThinking: (text) => sendEvent("thinking", { text }),
               onToken: (text) => sendEvent("token", { text }),
             });
             sendEvent("done", { plan: content, model });
           } catch (err) {
-            sendEvent("error", {
-              error:
-                err instanceof Error
-                  ? err.message
-                  : "Failed to generate study plan",
-            });
+            if (!(err instanceof Error && err.name === "AbortError")) {
+              sendEvent("error", {
+                error:
+                  err instanceof Error
+                    ? err.message
+                    : "Failed to generate study plan",
+              });
+            }
           } finally {
             controller.close();
           }
@@ -64,6 +68,8 @@ export async function POST(request: NextRequest) {
 
     const { content, model } = await callAiChat({
       userId: user.id,
+      logFeature: "study_plan",
+      signal: request.signal,
       ...aiRequest,
     });
 

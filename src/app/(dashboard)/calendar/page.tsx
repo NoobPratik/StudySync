@@ -33,8 +33,12 @@ import {
   Sparkles,
   Loader2,
   CheckSquare,
+  Square,
+  Zap,
 } from "lucide-react";
 import { StudyHeroEmblem } from "@/components/ui/study-emblem";
+import { AiLogsButton } from "@/components/ui/ai-logs-dialog";
+import { useBackgroundAi } from "@/components/background-extraction-provider";
 import { useElapsedSeconds } from "@/hooks/use-elapsed-timer";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -236,6 +240,8 @@ export default function CalendarPage() {
 
   // Timetable Import Studio state
   const ttFileRef = useRef<HTMLInputElement>(null);
+  const ttAbortRef = useRef<AbortController | null>(null);
+  const { upsertExternalTask, dismissAiTask } = useBackgroundAi();
   const [ttOpen, setTtOpen] = useState(false);
   const [ttFile, setTtFile] = useState<File | null>(null);
   const [ttPreviewUrl, setTtPreviewUrl] = useState<string | null>(null);
@@ -582,11 +588,28 @@ export default function CalendarPage() {
       toast.error("Upload your timetable screenshot/PDF or paste text first");
       return;
     }
+    ttAbortRef.current?.abort();
+    const ac = new AbortController();
+    ttAbortRef.current = ac;
     setTtParsing(true);
     setTtStreamThinking("");
     setTtStreamOutput("");
     setTtStreamError(null);
     setTtDebugMeta(null);
+
+    const taskId = "timetable-parse";
+    upsertExternalTask(
+      {
+        id: taskId,
+        feature: "timetable_extract",
+        title: "Smart Timetable Importer",
+        subtitle: `Scanning ${ttFile ? ttFile.name : "pasted schedule"}...`,
+        status: "running",
+        actionLabel: "Review Slots",
+        onOpenResult: () => setTtOpen(true),
+      },
+      () => ac.abort(),
+    );
 
     try {
       const fd = new FormData();
@@ -598,6 +621,7 @@ export default function CalendarPage() {
       const res = await fetch("/api/ai/timetable", {
         method: "POST",
         body: fd,
+        signal: ac.signal,
       });
 
       if (!res.ok) {
@@ -628,6 +652,15 @@ export default function CalendarPage() {
       });
 
       if (extractedEntries.length === 0) {
+        upsertExternalTask({
+          id: taskId,
+          feature: "timetable_extract",
+          title: "Smart Timetable Importer",
+          subtitle: "No class slots detected",
+          status: "done",
+          actionLabel: "Inspect",
+          onOpenResult: () => setTtOpen(true),
+        });
         toast.info(
           "No class slots detected — inspect the Live AI Log below or try a clearer image.",
         );
@@ -640,17 +673,50 @@ export default function CalendarPage() {
           include: entry.recommended !== false,
         })),
       );
+      upsertExternalTask({
+        id: taskId,
+        feature: "timetable_extract",
+        title: "Smart Timetable Importer",
+        subtitle: `Found ${extractedEntries.length} class slots ready to review`,
+        status: "done",
+        actionLabel: "Review Slots",
+        onOpenResult: () => setTtOpen(true),
+      });
       toast.success(
         `Detected ${extractedEntries.length} timetable slot(s)! Review and uncheck any that don't apply.`,
       );
     } catch (err) {
-      const msg =
-        err instanceof Error ? err.message : "Timetable extraction failed";
-      setTtStreamError(msg);
-      toast.error(msg);
+      if (err instanceof DOMException && err.name === "AbortError") {
+        upsertExternalTask({
+          id: taskId,
+          feature: "timetable_extract",
+          title: "Smart Timetable Importer",
+          subtitle: "Stopped by user",
+          status: "stopped",
+        });
+        toast.info("Timetable scan stopped");
+      } else {
+        const msg =
+          err instanceof Error ? err.message : "Timetable extraction failed";
+        setTtStreamError(msg);
+        upsertExternalTask({
+          id: taskId,
+          feature: "timetable_extract",
+          title: "Smart Timetable Importer",
+          subtitle: "Scan failed",
+          status: "error",
+          errorText: msg,
+        });
+        toast.error(msg);
+      }
     } finally {
+      ttAbortRef.current = null;
       setTtParsing(false);
     }
+  }
+
+  function stopTimetableParse() {
+    ttAbortRef.current?.abort();
   }
 
   async function handleImportSelectedTimetable() {
@@ -688,6 +754,7 @@ export default function CalendarPage() {
       setTtRows([]);
       selectTimetableFile(null);
       setTtRawText("");
+      dismissAiTask("timetable-parse");
       fetchEvents();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to import");
@@ -715,13 +782,66 @@ export default function CalendarPage() {
         ? format(anchorDate, "MMMM yyyy")
         : format(selectedDate, "EEEE, d MMMM yyyy");
 
+  const dayGridBounds = useMemo(() => {
+    let minHour = 8;
+    let maxHour = 17;
+    for (const ev of selectedDayEvents) {
+      if (ev.allDay) continue;
+      const s = new Date(ev.startAt);
+      const e = new Date(ev.endAt);
+      minHour = Math.min(minHour, s.getHours());
+      maxHour = Math.max(maxHour, e.getHours() + (e.getMinutes() > 0 ? 1 : 0));
+    }
+    const startHour = Math.max(6, minHour);
+    const endHour = Math.min(22, Math.max(startHour + 6, maxHour));
+    const hours: number[] = [];
+    for (let h = startHour; h <= endHour; h++) hours.push(h);
+    return { startHour, endHour, hours };
+  }, [selectedDayEvents]);
+
+  const [nowMs, setNowMs] = useState<number>(0);
+  useEffect(() => {
+    const tick = () => setNowMs(Date.now());
+    const init = setTimeout(tick, 0);
+    const id = setInterval(tick, 30000);
+    return () => {
+      clearTimeout(init);
+      clearInterval(id);
+    };
+  }, []);
+
+  const nowDate = useMemo(
+    () => (nowMs > 0 ? new Date(nowMs) : null),
+    [nowMs],
+  );
+  const isSelectedToday = nowDate ? isSameDay(selectedDate, nowDate) : false;
+  const nextOrCurrentTodayEvent = useMemo(() => {
+    const todaySorted = [...selectedDayEvents]
+      .filter((e) => !e.allDay)
+      .sort(
+        (a, b) =>
+          new Date(a.startAt).getTime() - new Date(b.startAt).getTime(),
+      );
+    if (nowMs <= 0) return todaySorted[0] || null;
+    return (
+      todaySorted.find(
+        (e) =>
+          new Date(e.startAt).getTime() <= nowMs &&
+          new Date(e.endAt).getTime() > nowMs,
+      ) ||
+      todaySorted.find((e) => new Date(e.startAt).getTime() > nowMs) ||
+      todaySorted[0] ||
+      null
+    );
+  }, [selectedDayEvents, nowMs]);
+
   return (
     <div className="space-y-6">
       {/* Header */}
       <motion.div
         initial={{ opacity: 0, y: 12 }}
         animate={{ opacity: 1, y: 0 }}
-        className="flex flex-col sm:flex-row sm:items-center justify-between gap-4"
+        className="flex flex-col sm:flex-row sm:items-end justify-between gap-4"
       >
         <div>
           <StudyHeroEmblem icon={CalendarIcon} eyebrow="Weekly Schedule" accentColor="indigo" />
@@ -729,11 +849,12 @@ export default function CalendarPage() {
             Academic <span className="gradient-text">Calendar</span>
           </h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Weekly recurring timetables, daily lectures, labs, holidays, and
-            exams
+            Weekly recurring timetables, proportional daily timeline, holidays,
+            and exams
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
+          <AiLogsButton size="sm" variant="outline" className="h-10" />
           {rawEvents.length > 0 && (
             <Button
               variant="outline"
@@ -755,8 +876,8 @@ export default function CalendarPage() {
         </div>
       </motion.div>
 
-      {/* Toolbar: View Switcher + Navigation + Filters */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+      {/* Unified Toolbar Strip (curved studio shell) */}
+      <div className="studio-shell p-3 sm:px-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
         <div className="flex items-center gap-2 flex-wrap">
           <div className="inline-flex rounded-lg bg-muted p-1 gap-1">
             {(["WEEK", "MONTH", "DAY"] as const).map((mode) => (
@@ -1484,107 +1605,379 @@ export default function CalendarPage() {
         </div>
       )}
 
-      {/* DAY VIEW */}
-      {viewMode === "DAY" && (
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between">
-            <div>
-              <CardTitle>{format(selectedDate, "EEEE, d MMMM yyyy")}</CardTitle>
-              <p className="text-xs text-muted-foreground mt-1">
-                {selectedDayEvents.length} scheduled item(s)
-              </p>
-            </div>
-            <Button
-              size="sm"
-              variant="glow"
-              onClick={() => openNewDialog(selectedDate)}
-            >
-              <Plus className="h-4 w-4" /> Add Lecture / Event
-            </Button>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {selectedDayEvents.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-glass-border p-12 text-center space-y-3">
-                <CalendarIcon className="h-10 w-10 text-muted-foreground mx-auto" />
-                <p className="text-sm text-muted-foreground">
-                  No lectures or events on this day.
-                </p>
-              </div>
-            ) : (
-              selectedDayEvents.map((ev) => (
-                <div
-                  key={ev.occurrenceId || ev.id}
-                  className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-xl border border-glass-border bg-muted/40 p-4"
-                  style={{
-                    borderLeft: `4px solid ${ev.color || getEventTypeColor(ev.eventType)}`,
-                  }}
-                >
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-semibold text-foreground">
-                        {ev.title}
-                      </span>
-                      <Badge variant="outline">{ev.eventType}</Badge>
-                      {ev.isRecurring && (
-                        <Badge className="gap-1 text-[10px]">
-                          <Repeat className="h-3 w-3" /> Recurring
-                        </Badge>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-4 text-xs text-muted-foreground">
-                      <span className="inline-flex items-center gap-1">
-                        <Clock className="h-3.5 w-3.5" />
-                        {ev.allDay
-                          ? "All Day"
-                          : `${format(new Date(ev.startAt), "hh:mm a")} – ${format(new Date(ev.endAt), "hh:mm a")}`}
-                      </span>
-                      {ev.location && (
-                        <span className="inline-flex items-center gap-1 text-accent">
-                          <MapPin className="h-3.5 w-3.5" />
-                          {ev.location}
-                        </span>
-                      )}
-                    </div>
-                    {ev.description && (
-                      <p className="text-xs text-muted-foreground">
-                        {ev.description}
-                      </p>
+      {/* DAY VIEW — Proportional Timeline Studio + Focus Inspector */}
+      {viewMode === "DAY" && (() => {
+        const timedDayEvents = [...selectedDayEvents]
+          .filter((e) => !e.allDay)
+          .sort(
+            (a, b) =>
+              new Date(a.startAt).getTime() - new Date(b.startAt).getTime(),
+          );
+        const allDayEvents = selectedDayEvents.filter((e) => e.allDay);
+        const lectureCount = selectedDayEvents.filter(
+          (e) => e.eventType === "LECTURE",
+        ).length;
+        const labCount = selectedDayEvents.filter(
+          (e) => e.eventType === "LAB",
+        ).length;
+        const examCount = selectedDayEvents.filter(
+          (e) => e.eventType === "EXAM",
+        ).length;
+
+        const nowMinutes = nowDate
+          ? (nowDate.getHours() - dayGridBounds.startHour) * 60 +
+            nowDate.getMinutes()
+          : -1;
+        const showNowLine =
+          Boolean(nowDate) &&
+          isSelectedToday &&
+          nowMinutes >= 0 &&
+          nowMinutes <=
+            (dayGridBounds.endHour - dayGridBounds.startHour) * 60;
+        const nowLineTopPx = (nowMinutes / 60) * HOUR_ROW_HEIGHT;
+
+        return (
+          <div className="studio-shell grid grid-cols-1 lg:grid-cols-12">
+            {/* Left 8-col: Interactive Proportional Hourly Timeline */}
+            <div className="lg:col-span-8 flex flex-col border-b lg:border-b-0 lg:border-r border-glass-border/60">
+              {/* Timeline Sub-Header */}
+              <div className="px-5 py-3.5 border-b border-glass-border/60 bg-muted/20 flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2.5">
+                  <span
+                    className={cn(
+                      "h-8 w-8 rounded-xl flex items-center justify-center text-sm font-bold",
+                      isSelectedToday
+                        ? "bg-primary text-white shadow-md shadow-primary/30"
+                        : "bg-muted text-foreground",
                     )}
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => openEditSeries(ev.id)}
-                    >
-                      <Edit2 className="h-4 w-4" />
-                    </Button>
-                    {ev.isRecurring && (
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="text-warning"
-                        onClick={() => skipOccurrence(ev.id, ev.startAt)}
-                        title="Skip this day only"
-                      >
-                        <Ban className="h-4 w-4" />
-                      </Button>
-                    )}
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="text-destructive"
-                      onClick={() => handleDelete(ev.id)}
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
+                  >
+                    {format(selectedDate, "d")}
+                  </span>
+                  <div>
+                    <h3 className="text-sm font-semibold text-foreground leading-tight">
+                      {format(selectedDate, "EEEE, MMMM yyyy")}
+                    </h3>
+                    <p className="text-[11px] text-muted-foreground">
+                      {selectedDayEvents.length === 0
+                        ? "Free day"
+                        : `${selectedDayEvents.length} scheduled item${selectedDayEvents.length === 1 ? "" : "s"} • ${tzLabel}`}
+                    </p>
                   </div>
                 </div>
-              ))
-            )}
-          </CardContent>
-        </Card>
-      )}
+
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {lectureCount > 0 && (
+                    <Badge variant="outline" className="text-[10px]">
+                      {lectureCount} Lecture{lectureCount === 1 ? "" : "s"}
+                    </Badge>
+                  )}
+                  {labCount > 0 && (
+                    <Badge variant="warning" className="text-[10px]">
+                      {labCount} Lab{labCount === 1 ? "" : "s"}
+                    </Badge>
+                  )}
+                  {examCount > 0 && (
+                    <Badge variant="destructive" className="text-[10px]">
+                      {examCount} Exam{examCount === 1 ? "" : "s"}
+                    </Badge>
+                  )}
+                </div>
+              </div>
+
+              {/* All-Day Strip */}
+              {allDayEvents.length > 0 && (
+                <div className="px-5 py-2.5 border-b border-glass-border/50 bg-primary/5 flex flex-wrap gap-2">
+                  {allDayEvents.map((ev) => {
+                    const pal = getEventPalette(ev);
+                    return (
+                      <button
+                        key={ev.occurrenceId || ev.id}
+                        type="button"
+                        onClick={() => openEditSeries(ev.id)}
+                        className="rounded-lg border px-2.5 py-1 text-xs font-medium cursor-pointer"
+                        style={{
+                          backgroundColor: pal.bg,
+                          borderColor: `${pal.border}55`,
+                          color: pal.text,
+                        }}
+                      >
+                        All Day: {ev.title}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Hourly Ruler + Positioned Blocks */}
+              {selectedDayEvents.length === 0 ? (
+                <div className="flex-1 min-h-[380px] p-10 flex flex-col items-center justify-center text-center space-y-3">
+                  <div className="h-12 w-12 rounded-2xl bg-primary/15 border border-primary/30 flex items-center justify-center">
+                    <CalendarIcon className="h-6 w-6 text-primary" />
+                  </div>
+                  <div className="space-y-1">
+                    <h4 className="text-base font-semibold text-foreground">
+                      Clear Schedule
+                    </h4>
+                    <p className="text-xs text-muted-foreground max-w-sm">
+                      No lectures, labs, or exams on {format(selectedDate, "EEEE")}. Use &ldquo;Add Event / Lecture&rdquo; above to schedule one.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-4 sm:p-5 overflow-x-auto">
+                  <div
+                    className="grid relative min-w-[440px] select-none"
+                    style={{
+                      gridTemplateColumns: "64px minmax(0, 1fr)",
+                      height: `${(dayGridBounds.endHour - dayGridBounds.startHour) * HOUR_ROW_HEIGHT}px`,
+                    }}
+                  >
+                    {/* Hour Labels */}
+                    <div className="relative border-r border-glass-border/50">
+                      {dayGridBounds.hours.slice(0, -1).map((hour, idx) => (
+                        <div
+                          key={hour}
+                          className="absolute left-0 right-0 pr-3 text-right text-[11px] font-mono text-muted-foreground/80"
+                          style={{ top: `${idx * HOUR_ROW_HEIGHT + 4}px` }}
+                        >
+                          {hour === 12
+                            ? "12 PM"
+                            : hour > 12
+                              ? `${hour - 12} PM`
+                              : `${hour} AM`}
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Event Track */}
+                    <div className="relative">
+                      {dayGridBounds.hours.slice(0, -1).map((hour, idx) => (
+                        <div
+                          key={hour}
+                          className="absolute left-0 right-0 border-t border-glass-border/35 pointer-events-none"
+                          style={{
+                            top: `${idx * HOUR_ROW_HEIGHT}px`,
+                            height: `${HOUR_ROW_HEIGHT}px`,
+                          }}
+                        >
+                          <div className="w-full border-t border-dashed border-glass-border/15 mt-[41px]" />
+                        </div>
+                      ))}
+
+                      {/* Live Current Time Indicator */}
+                      {showNowLine && nowDate && (
+                        <div
+                          className="absolute left-0 right-0 z-30 flex items-center pointer-events-none"
+                          style={{ top: `${nowLineTopPx}px` }}
+                        >
+                          <span className="h-2.5 w-2.5 -ml-1.5 rounded-full bg-primary shadow-[0_0_12px_rgba(124,58,237,0.9)]" />
+                          <div className="flex-1 h-[2px] bg-gradient-to-r from-primary via-accent to-transparent" />
+                          <span className="rounded-md bg-primary px-1.5 py-0.5 text-[9px] font-mono font-bold text-white shadow">
+                            {format(nowDate, "HH:mm")}
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Timed Event Cards */}
+                      {timedDayEvents.map((ev) => {
+                        const s = new Date(ev.startAt);
+                        const e = new Date(ev.endAt);
+                        const startMin =
+                          (s.getHours() - dayGridBounds.startHour) * 60 +
+                          s.getMinutes();
+                        const endMin =
+                          (e.getHours() - dayGridBounds.startHour) * 60 +
+                          e.getMinutes();
+                        const durationMin = Math.max(30, endMin - startMin);
+                        const topPx = Math.max(
+                          2,
+                          (startMin / 60) * HOUR_ROW_HEIGHT + 2,
+                        );
+                        const heightPx = Math.max(
+                          46,
+                          (durationMin / 60) * HOUR_ROW_HEIGHT - 4,
+                        );
+                        const pal = getEventPalette(ev);
+
+                        return (
+                          <div
+                            key={ev.occurrenceId || ev.id}
+                            onClick={() => openEditSeries(ev.id)}
+                            className="absolute left-3 right-2 rounded-2xl border px-4 py-2.5 group cursor-pointer transition-all hover:z-20 hover:shadow-xl hover:brightness-110 flex items-center justify-between gap-3"
+                            style={{
+                              top: `${topPx}px`,
+                              height: `${heightPx}px`,
+                              backgroundColor: pal.bg,
+                              borderColor: `${pal.border}55`,
+                              borderLeftWidth: "4px",
+                              borderLeftColor: pal.border,
+                            }}
+                          >
+                            <div className="min-w-0 flex-1 space-y-0.5">
+                              <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                                <span
+                                  className="text-sm font-semibold truncate"
+                                  style={{ color: pal.text }}
+                                >
+                                  {ev.title}
+                                </span>
+                                <Badge variant="outline" className="text-[10px] shrink-0">
+                                  {ev.eventType}
+                                </Badge>
+                                {ev.isRecurring && (
+                                  <Badge className="gap-1 text-[10px] shrink-0">
+                                    <Repeat className="h-2.5 w-2.5" /> Weekly
+                                  </Badge>
+                                )}
+                              </div>
+                              <div className="flex items-center gap-3 text-xs text-foreground/75 flex-wrap">
+                                <span className="inline-flex items-center gap-1 font-mono text-[11px]">
+                                  <Clock className="h-3 w-3" />
+                                  {formatCompactTimeRange(ev.startAt, ev.endAt)}
+                                </span>
+                                <span className="text-[10px] text-foreground/60">
+                                  ({durationMin}m)
+                                </span>
+                                {ev.location && (
+                                  <span className="inline-flex items-center gap-1 text-[11px] text-accent">
+                                    <MapPin className="h-3 w-3" />
+                                    {ev.location}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+
+                            <div
+                              className="flex items-center gap-1 shrink-0 opacity-80 group-hover:opacity-100 bg-background/60 backdrop-blur-sm rounded-lg p-1"
+                              onClick={(evt) => evt.stopPropagation()}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => openEditSeries(ev.id)}
+                                className="p-1.5 rounded-md hover:bg-glass-hover text-foreground/85 cursor-pointer"
+                                title="Edit series"
+                              >
+                                <Edit2 className="h-3.5 w-3.5" />
+                              </button>
+                              {ev.isRecurring && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    skipOccurrence(ev.id, ev.startAt)
+                                  }
+                                  className="p-1.5 rounded-md hover:bg-glass-hover text-amber-400 cursor-pointer"
+                                  title="Skip this day only"
+                                >
+                                  <Ban className="h-3.5 w-3.5" />
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => handleDelete(ev.id)}
+                                className="p-1.5 rounded-md hover:bg-glass-hover text-destructive cursor-pointer"
+                                title="Delete series"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Right 4-col: Selected Day Spotlight & Chronological Feed */}
+            <div className="lg:col-span-4 bg-muted/15 p-5 flex flex-col gap-4">
+              {nextOrCurrentTodayEvent ? (
+                <div className="rounded-2xl border border-primary/40 bg-gradient-to-br from-primary/15 via-secondary/10 to-transparent p-4 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-accent">
+                      <Zap className="h-3.5 w-3.5 text-primary" />
+                      {isSelectedToday &&
+                      nowDate &&
+                      new Date(nextOrCurrentTodayEvent.startAt) <= nowDate &&
+                      new Date(nextOrCurrentTodayEvent.endAt) > nowDate
+                        ? "Happening Now"
+                        : "Session Spotlight"}
+                    </span>
+                    <Badge variant="outline" className="text-[10px]">
+                      {nextOrCurrentTodayEvent.eventType}
+                    </Badge>
+                  </div>
+                  <p className="text-base font-bold text-foreground">
+                    {nextOrCurrentTodayEvent.title}
+                  </p>
+                  <p className="text-xs text-muted-foreground flex items-center gap-2 flex-wrap">
+                    <span className="inline-flex items-center gap-1">
+                      <Clock className="h-3.5 w-3.5 text-primary" />
+                      {formatCompactTimeRange(
+                        nextOrCurrentTodayEvent.startAt,
+                        nextOrCurrentTodayEvent.endAt,
+                      )}
+                    </span>
+                    {nextOrCurrentTodayEvent.location && (
+                      <span className="inline-flex items-center gap-1 text-accent">
+                        <MapPin className="h-3.5 w-3.5" />
+                        {nextOrCurrentTodayEvent.location}
+                      </span>
+                    )}
+                  </p>
+                </div>
+              ) : (
+                <div className="rounded-2xl border border-glass-border/60 bg-muted/25 p-4 text-xs text-muted-foreground">
+                  Open schedule — use this time for deep syllabus study or flashcards.
+                </div>
+              )}
+
+              <div className="space-y-2 flex-1">
+                <h4 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Day Rundown ({timedDayEvents.length})
+                </h4>
+                {timedDayEvents.length === 0 ? (
+                  <p className="text-xs text-muted-foreground/80">
+                    No timed sessions on this date.
+                  </p>
+                ) : (
+                  <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+                    {timedDayEvents.map((ev) => {
+                      const pal = getEventPalette(ev);
+                      return (
+                        <div
+                          key={`side-${ev.occurrenceId || ev.id}`}
+                          onClick={() => openEditSeries(ev.id)}
+                          className="rounded-xl border border-glass-border/70 bg-muted/35 p-3 hover:border-primary/40 transition-colors cursor-pointer flex items-center justify-between gap-2"
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <span
+                              className="h-2.5 w-2.5 rounded-full shrink-0"
+                              style={{ backgroundColor: pal.border }}
+                            />
+                            <div className="min-w-0">
+                              <p className="text-xs font-semibold text-foreground truncate">
+                                {ev.title}
+                              </p>
+                              <p className="text-[11px] text-muted-foreground truncate">
+                                {formatCompactTimeRange(ev.startAt, ev.endAt)}
+                                {ev.location ? ` • ${ev.location}` : ""}
+                              </p>
+                            </div>
+                          </div>
+                          <span className="text-[10px] font-mono text-muted-foreground shrink-0">
+                            {ev.eventType}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Add / Edit Dialog with Recurrence */}
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
@@ -1936,24 +2329,37 @@ export default function CalendarPage() {
                   />
                 </div>
 
-                <Button
-                  type="submit"
-                  variant="glow"
-                  disabled={ttParsing}
-                  className="shrink-0 h-10"
-                >
-                  {ttParsing ? (
-                    <>
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      Scanning ({ttElapsed}s)...
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="h-4 w-4" />
-                      Extract &amp; Preview Classes
-                    </>
+                <div className="flex items-center gap-2 shrink-0">
+                  <Button
+                    type="submit"
+                    variant="glow"
+                    disabled={ttParsing}
+                    className="h-10"
+                  >
+                    {ttParsing ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Scanning ({ttElapsed}s)...
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="h-4 w-4" />
+                        Extract &amp; Preview Classes
+                      </>
+                    )}
+                  </Button>
+                  {ttParsing && (
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      size="sm"
+                      className="h-10"
+                      onClick={stopTimetableParse}
+                    >
+                      <Square className="h-3.5 w-3.5" /> Stop
+                    </Button>
                   )}
-                </Button>
+                </div>
               </div>
 
               <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer pt-1 border-t border-glass-border/50">

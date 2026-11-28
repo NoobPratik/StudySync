@@ -67,6 +67,8 @@ export async function POST(request: NextRequest) {
 
     const { content } = await callAiChat({
       userId: user.id,
+      logFeature: "notes_categorize",
+      signal: request.signal,
       ...aiRequest,
     });
 
